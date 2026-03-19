@@ -25,10 +25,12 @@ class Commit(Base):
     author = Column(String)
     date = Column(DateTime)
     message = Column(Text)
+    pr_id = Column(Integer, ForeignKey("pull_requests.id"), nullable=True)
 
     repo = relationship("Repo", back_populates="commits")
     file_changes = relationship("FileChange", back_populates="commit")
     episode_memberships = relationship("EpisodeMember", back_populates="commit")
+    pr = relationship("PullRequest", foreign_keys=[pr_id])
 
 
 class PullRequest(Base):

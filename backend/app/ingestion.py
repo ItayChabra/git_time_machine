@@ -1,16 +1,20 @@
 from sqlalchemy.orm import Session
 from datetime import datetime
 import math
+import re
 
 from . import github_client, models
 from .database import SessionLocal
 
+ISSUE_REF_RE = re.compile(r"#(\d+)")
+
+def extract_issue_numbers(text: str | None) -> list[int]:
+    if not text:
+        return []
+    return [int(m) for m in ISSUE_REF_RE.findall(text)]
+
 
 def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
-    """
-    Background job: create its own DB session, ingest commits + file changes,
-    and update repo.status to "ready" or "error".
-    """
     db = SessionLocal()
     try:
         target_repo = db.query(models.Repo).filter_by(id=repo_id).first()
@@ -19,115 +23,148 @@ def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
 
         gh = github_client.GitHubClient()
 
+        # ── 1. Ingest commits + file changes ──────────────────────────────
         per_page = min(100, max_commits) if max_commits > 0 else 20
         max_pages = math.ceil(max_commits / per_page) if max_commits > 0 else 1
 
-        commits = gh.list_commits(
-            target_repo.owner,
-            target_repo.name,
-            per_page=per_page,
-            max_pages=max_pages,
+        raw_commits = gh.list_commits(
+            target_repo.owner, target_repo.name,
+            per_page=per_page, max_pages=max_pages,
         )
-        commits = commits[:max_commits] if max_commits > 0 else commits
+        raw_commits = raw_commits[:max_commits] if max_commits > 0 else raw_commits
 
-        for c in commits:
-            commit_author_date = (
-                c.get("commit", {})
-                .get("author", {})
-                .get("date", None)
-            )
-            if not commit_author_date:
+        sha_to_commit_obj: dict[str, models.Commit] = {}
+
+        for c in raw_commits:
+            commit_date = c.get("commit", {}).get("author", {}).get("date")
+            if not commit_date:
                 continue
 
             commit_obj = models.Commit(
                 repo_id=target_repo.id,
                 sha=c["sha"],
                 author=(c.get("commit", {}).get("author", {}) or {}).get("name"),
-                date=datetime.fromisoformat(commit_author_date.replace("Z", "+00:00")),
+                date=datetime.fromisoformat(commit_date.replace("Z", "+00:00")),
                 message=c["commit"]["message"],
+                pr_id=None,  # filled in step 3
             )
             db.add(commit_obj)
             db.flush()
 
+            sha_to_commit_obj[c["sha"]] = commit_obj
+
             files = gh.list_commit_files(target_repo.owner, target_repo.name, c["sha"])
             for f in files:
-                db.add(
-                    models.FileChange(
-                        commit_id=commit_obj.id,
-                        file_path=f["filename"],
-                        change_type=f.get("status", "modified"),
-                    )
-                )
+                db.add(models.FileChange(
+                    commit_id=commit_obj.id,
+                    file_path=f["filename"],
+                    change_type=f.get("status", "modified"),
+                ))
 
-        # MVP speed bounds: keep PRs/issues ingestion small.
-        max_prs = 20
-        max_issues = 20
-
+        # ── 2. Ingest PRs ─────────────────────────────────────────────────
         existing_pr_numbers = {
-            n[0] for n in db.query(models.PullRequest.number).filter_by(repo_id=target_repo.id).all()
-        }
-        existing_issue_numbers = {
-            n[0] for n in db.query(models.Issue.number).filter_by(repo_id=target_repo.id).all()
+            n[0] for n in db.query(models.PullRequest.number)
+            .filter_by(repo_id=target_repo.id).all()
         }
 
-        def parse_github_dt(dt_str: str | None):
+        def parse_dt(dt_str: str | None):
             if not dt_str:
                 return None
             return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
 
-        prs = gh.list_pulls(
-            target_repo.owner,
-            target_repo.name,
-            state="all",
-            per_page=max_prs,
-            max_pages=1,
+        raw_prs = gh.list_pulls(
+            target_repo.owner, target_repo.name,
+            state="all", per_page=20, max_pages=1,
         )
-        for pr in prs:
+
+        pr_number_to_obj: dict[int, models.PullRequest] = {}
+
+        for pr in raw_prs:
             pr_number = pr.get("number")
             if pr_number is None or pr_number in existing_pr_numbers:
                 continue
 
-            db.add(
-                models.PullRequest(
-                    repo_id=target_repo.id,
-                    number=pr_number,
-                    title=pr.get("title"),
-                    body=pr.get("body"),
-                    state=pr.get("state"),
-                    merged_at=parse_github_dt(pr.get("merged_at")),
-                )
+            pr_obj = models.PullRequest(
+                repo_id=target_repo.id,
+                number=pr_number,
+                title=pr.get("title"),
+                body=pr.get("body"),
+                state=pr.get("state"),
+                merged_at=parse_dt(pr.get("merged_at")),
             )
+            db.add(pr_obj)
+            db.flush()
+            pr_number_to_obj[pr_number] = pr_obj
             existing_pr_numbers.add(pr_number)
 
-        issues = gh.list_issues(
-            target_repo.owner,
-            target_repo.name,
-            state="all",
-            per_page=max_issues,
-            max_pages=1,
+        # ── 3. Link commits → PRs via PR commits API ──────────────────────
+        # One API call per PR (not per commit!) — O(PRs) not O(commits)
+        for pr_number, pr_obj in pr_number_to_obj.items():
+            pr_commit_shas = gh.list_pr_commit_shas(
+                target_repo.owner, target_repo.name, pr_number
+            )
+            for sha in pr_commit_shas:
+                commit_obj = sha_to_commit_obj.get(sha)
+                if commit_obj and commit_obj.pr_id is None:
+                    commit_obj.pr_id = pr_obj.id
+
+        # ── 4. Ingest issues ──────────────────────────────────────────────
+        existing_issue_numbers = {
+            n[0] for n in db.query(models.Issue.number)
+            .filter_by(repo_id=target_repo.id).all()
+        }
+
+        raw_issues = gh.list_issues(
+            target_repo.owner, target_repo.name,
+            state="all", per_page=20, max_pages=1,
         )
-        for issue in issues:
-            # The issues endpoint includes PRs; skip those.
+
+        issue_number_to_obj: dict[int, models.Issue] = {}
+
+        for issue in raw_issues:
             if issue.get("pull_request") is not None:
                 continue
-
             issue_number = issue.get("number")
             if issue_number is None or issue_number in existing_issue_numbers:
                 continue
 
-            db.add(
-                models.Issue(
-                    repo_id=target_repo.id,
-                    number=issue_number,
-                    title=issue.get("title"),
-                    body=issue.get("body"),
-                    state=issue.get("state"),
-                )
+            issue_obj = models.Issue(
+                repo_id=target_repo.id,
+                number=issue_number,
+                title=issue.get("title"),
+                body=issue.get("body"),
+                state=issue.get("state"),
             )
+            db.add(issue_obj)
+            db.flush()
+            issue_number_to_obj[issue_number] = issue_obj
             existing_issue_numbers.add(issue_number)
+
+        # ── 5. Link commits/PRs → issues via #123 references ─────────────
+        all_issue_objs = {
+            **issue_number_to_obj,
+            **{
+                n: obj for n, obj in (
+                    (i.number, i)
+                    for i in db.query(models.Issue).filter_by(repo_id=target_repo.id).all()
+                )
+            }
+        }
+
+        for commit_obj in sha_to_commit_obj.values():
+            for issue_num in extract_issue_numbers(commit_obj.message):
+                issue_obj = all_issue_objs.get(issue_num)
+                if issue_obj:
+                    db.add(models.EpisodeMember(
+                        episode_id=None,  # no episode yet — placeholder linkage
+                        commit_id=commit_obj.id,
+                        issue_id=issue_obj.id,
+                        member_type="issue_ref",
+                    ))
 
         target_repo.status = "ready"
         db.commit()
+
     except Exception:
         db.rollback()
         if target_repo:
