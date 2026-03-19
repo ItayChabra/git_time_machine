@@ -1,0 +1,14 @@
+# Environments
+venv/
+env/
+
+# Environment variables
+.env
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# IDEs
+.vscode/
+.cursorrules
