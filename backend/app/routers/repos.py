@@ -47,7 +47,7 @@ def add_repo(
     return repo
 
 
-@router.get("/", response_model=schemas.RepoListOut)
+@router.get("/", response_model=list[schemas.RepoOut])
 def list_repos(db: Session = Depends(get_db)):
     return db.query(models.Repo).all()
 
