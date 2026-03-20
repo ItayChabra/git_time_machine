@@ -4,187 +4,231 @@ import re
 from datetime import timedelta
 from typing import List
 
-import requests
+from sqlalchemy import and_, select
+from sqlalchemy.orm import aliased
 from sqlalchemy.orm import Session
 
-from . import github_client, models, schemas
+from . import models, schemas
+from .llm import summarize_episode, summarize_file_evolution
+
+
+def _parse_issue_numbers(text: str) -> list[int]:
+    return [int(m) for m in re.findall(r"#(\d+)", text or "")]
+
+
+def _build_llm_context(window: list[models.Commit], pr: models.PullRequest | None, issue: models.Issue | None) -> dict:
+    return {
+        "pr_title": pr.title if pr else "",
+        "pr_body": (pr.body[:600] if pr and pr.body else ""),
+        "commit_messages": "\n".join(c.message or "" for c in window)[:600],
+        "issue_title": issue.title if issue else "",
+        "issue_body": (issue.body[:400] if issue and issue.body else ""),
+    }
+
+
+def build_and_persist_episodes(repo_id: int, db: Session) -> None:
+    """
+    Groups commits per file into time-windowed episodes, calls LLM per episode,
+    and persists Episode + EpisodeMember rows. Safe to re-run (clears old rows first).
+    """
+    # Clear existing episodes for this repo
+    old_eps = db.query(models.Episode).filter_by(repo_id=repo_id).all()
+    for ep in old_eps:
+        db.query(models.EpisodeMember).filter_by(episode_id=ep.id).delete()
+        db.delete(ep)
+    db.commit()
+
+    # Fetch all commits for this repo ordered by date
+    commits = (
+        db.query(models.Commit)
+        .filter_by(repo_id=repo_id)
+        .filter(models.Commit.date.isnot(None))
+        .order_by(models.Commit.date.asc())
+        .all()
+    )
+    if not commits:
+        return
+
+    # Group commits into windows (1-day gap = new episode)
+    windows: list[list[models.Commit]] = []
+    window: list[models.Commit] = [commits[0]]
+    window_end = commits[0].date
+
+    for c in commits[1:]:
+        if c.date - window_end <= timedelta(days=1):
+            window.append(c)
+            window_end = c.date
+        else:
+            windows.append(window)
+            window = [c]
+            window_end = c.date
+    windows.append(window)
+
+    for window_commits in windows:
+        pr: models.PullRequest | None = None
+        issue: models.Issue | None = None
+
+        # (a) If any commit in the window is already linked to a PR, use that PR and skip further lookup.
+        linked_commit = next((c for c in window_commits if c.pr_id is not None), None)
+        if linked_commit is not None:
+            pr = db.query(models.PullRequest).filter_by(id=linked_commit.pr_id).first()
+
+        # (b) Otherwise, do a local DB heuristic to associate a PR to this episode's commits.
+        if pr is None:
+            # Heuristic window: "merged_at within 1 hour after commit date"
+            # plus a slightly larger window to approximate PR creation time (since we don't store it).
+            approx_hours_after_commit = 24
+
+            for c in window_commits:
+                # Only consider merged PRs.
+                pr_match = (
+                    db.query(models.PullRequest)
+                    .filter_by(repo_id=repo_id)
+                    .filter(models.PullRequest.merged_at.isnot(None))
+                    .filter(models.PullRequest.merged_at >= c.date)
+                    .filter(models.PullRequest.merged_at <= c.date + timedelta(hours=approx_hours_after_commit))
+                    .order_by(models.PullRequest.merged_at.asc())
+                    .first()
+                )
+
+                if pr_match is None:
+                    continue
+
+                # Cache association for future episodes.
+                c.pr_id = pr_match.id
+                db.flush()
+                pr = pr_match
+                break
+
+        # Find linked issue via #number mentions
+        all_text = " ".join([
+            *(c.message or "" for c in window_commits),
+            pr.title if pr else "",
+            pr.body if pr and pr.body else "",
+        ])
+        issue_numbers = _parse_issue_numbers(all_text)
+        if issue_numbers:
+            issue = (
+                db.query(models.Issue)
+                .filter_by(repo_id=repo_id, number=issue_numbers[0])
+                .first()
+            )
+
+        if pr:
+            title = f"PR #{pr.number}: {pr.title or 'No Title'}"
+        elif issue:
+            title = f"Issue #{issue.number}: {issue.title or 'No Title'}"
+        else:
+            title = f"Changes on {window_commits[0].date.date().isoformat()}"
+
+        context = _build_llm_context(window_commits, pr, issue)
+        llm_summary = summarize_episode(context)
+
+        ep = models.Episode(
+            repo_id=repo_id,
+            title=title,
+            start_date=window_commits[0].date,
+            end_date=window_commits[-1].date,
+            llm_summary=llm_summary,
+        )
+        db.add(ep)
+        db.flush()
+
+        for c in window_commits:
+            db.add(models.EpisodeMember(episode_id=ep.id, commit_id=c.id, member_type="commit"))
+        if pr:
+            db.add(models.EpisodeMember(episode_id=ep.id, pr_id=pr.id, member_type="pr"))
+        if issue:
+            db.add(models.EpisodeMember(episode_id=ep.id, issue_id=issue.id, member_type="issue"))
+
+    db.commit()
 
 
 def episodes_for_file(repo_id: int, file_path: str, db: Session) -> List[schemas.EpisodeSummary]:
     """
-    Build chronological EpisodeSummary list for a file within a repo.
-
-    Windowing rule: commits whose timestamps are within 1 day of the previous commit
-    belong to the same episode.
+    Reads persisted episodes that touch the given file, returns them sorted by date.
     """
-    repo = db.query(models.Repo).filter_by(id=repo_id).first()
-    if not repo:
-        return []
-
-    gh = None
-    try:
-        gh = github_client.GitHubClient()
-    except RuntimeError:
-        # If GITHUB_TOKEN is not set, we can still compute episodes, just without PR context.
-        gh = None
-
-    commits = (
-        db.query(models.Commit, models.FileChange)
+    commit_ids_for_file = (
+        select(models.Commit.id)
         .join(models.FileChange, models.FileChange.commit_id == models.Commit.id)
-        .filter(
+        .where(
             models.Commit.repo_id == repo_id,
             models.FileChange.file_path == file_path,
-            models.Commit.date.isnot(None),
         )
-        .order_by(models.Commit.date.asc())
-        .all()
+        .subquery()
     )
 
-    # De-duplicate in case the join returns multiple rows per commit for the same file.
-    deduped_commits: list[models.Commit] = []
-    seen_commit_ids: set[int] = set()
-    for commit, _file_change in commits:
-        if commit.id in seen_commit_ids:
-            continue
-        seen_commit_ids.add(commit.id)
-        deduped_commits.append(commit)
+    episode_ids_for_file = (
+        select(models.EpisodeMember.episode_id)
+        .where(
+            models.EpisodeMember.commit_id.in_(commit_ids_for_file),
+            models.EpisodeMember.member_type == "commit",
+        )
+        .distinct()
+    )
 
-    if not deduped_commits:
-        return []
+    pr_member = aliased(models.EpisodeMember)
+    issue_member = aliased(models.EpisodeMember)
 
-    episodes: list[tuple[list[models.Commit], schemas.EpisodeSummary]] = []
-
-    window_commits: list[models.Commit] = []
-    window_start = deduped_commits[0].date
-    window_end = deduped_commits[0].date
-
-    def build_title(author: str | None, date_value) -> str:
-        author_str = author or "unknown"
-        # date_value is guaranteed non-null by query filters.
-        return f"Changes by {author_str} on {date_value.date().isoformat()}"
-
-    def extract_pr_number_from_html_url(html_url: str | None) -> int | None:
-        if not html_url:
-            return None
-        m = re.search(r"/pull/(\d+)", html_url)
-        if not m:
-            return None
-        return int(m.group(1))
-
-    def fetch_commit_html_url(sha: str) -> str | None:
-        if gh is None:
-            return None
-        headers = gh._headers()
-        try:
-            resp = requests.get(
-                f"{github_client.GITHUB_API_BASE}/repos/{repo.owner}/{repo.name}/commits/{sha}",
-                headers=headers,
-                timeout=30,
-            )
-            if resp.status_code != 200:
-                return None
-            return resp.json().get("html_url")
-        except requests.RequestException:
-            return None
-
-    def fetch_pr(pr_number: int) -> dict | None:
-        if gh is None:
-            return None
-        headers = gh._headers()
-        try:
-            resp = requests.get(
-                f"{github_client.GITHUB_API_BASE}/repos/{repo.owner}/{repo.name}/pulls/{pr_number}",
-                headers=headers,
-                timeout=30,
-            )
-            if resp.status_code != 200:
-                return None
-            return resp.json()
-        except requests.RequestException:
-            return None
-
-    window_commits.append(deduped_commits[0])
-
-    for c in deduped_commits[1:]:
-        if c.date is None or window_end is None:
-            # If dates are missing, keep everything in the same window rather than splitting.
-            window_commits.append(c)
-            continue
-
-        # If the new commit is within 1 day of the previous commit, keep it in the same episode.
-        if c.date - window_end <= timedelta(days=1):
-            window_commits.append(c)
-            window_end = c.date
-        else:
-            # Finalize current episode summary.
-            ep_start = window_start
-            ep_end = window_end
-            first = window_commits[0]
-            title = build_title(first.author, ep_start)
-            llm_summary = None
-            if gh is not None:
-                for commit in window_commits:
-                    html_url = fetch_commit_html_url(commit.sha)
-                    pr_number = extract_pr_number_from_html_url(html_url)
-                    if not pr_number:
-                        continue
-                    pr_data = fetch_pr(pr_number)
-                    if not pr_data:
-                        continue
-                    title = f"PR #{pr_data.get('number')}: {pr_data.get('title')}"
-                    body = pr_data.get("body")
-                    llm_summary = (body[:200] + "...") if body is not None else None
-                    break
-
-            episodes.append(
-                (
-                    window_commits,
-                    schemas.EpisodeSummary(
-                        id=len(episodes) + 1,
-                        title=title,
-                        start_date=ep_start,
-                        end_date=ep_end,
-                        llm_summary=llm_summary,
-                    ),
-                )
-            )
-
-            # Start a new episode window.
-            window_commits = [c]
-            window_start = c.date
-            window_end = c.date
-
-    # Finalize the last episode.
-    ep_start = window_start
-    ep_end = window_end
-    first = window_commits[0]
-    title = build_title(first.author, ep_start)
-    llm_summary = None
-    if gh is not None:
-        for commit in window_commits:
-            html_url = fetch_commit_html_url(commit.sha)
-            pr_number = extract_pr_number_from_html_url(html_url)
-            if not pr_number:
-                continue
-            pr_data = fetch_pr(pr_number)
-            if not pr_data:
-                continue
-            title = f"PR #{pr_data.get('number')}: {pr_data.get('title')}"
-            body = pr_data.get("body")
-            llm_summary = (body[:200] + "...") if body is not None else None
-            break
-
-    episodes.append(
-        (
-            window_commits,
-            schemas.EpisodeSummary(
-                id=len(episodes) + 1,
-                title=title,
-                start_date=ep_start,
-                end_date=ep_end,
-                llm_summary=llm_summary,
+    stmt = (
+        select(
+            models.Episode.id,
+            models.Episode.title,
+            models.Episode.start_date,
+            models.Episode.end_date,
+            models.Episode.llm_summary,
+            models.PullRequest.number.label("pr_number"),
+            models.Issue.number.label("issue_number"),
+        )
+        .outerjoin(
+            pr_member,
+            and_(
+                pr_member.episode_id == models.Episode.id,
+                pr_member.member_type == "pr",
             ),
         )
+        .outerjoin(models.PullRequest, models.PullRequest.id == pr_member.pr_id)
+        .outerjoin(
+            issue_member,
+            and_(
+                issue_member.episode_id == models.Episode.id,
+                issue_member.member_type == "issue",
+            ),
+        )
+        .outerjoin(models.Issue, models.Issue.id == issue_member.issue_id)
+        .where(models.Episode.id.in_(episode_ids_for_file))
+        .order_by(models.Episode.start_date.asc())
     )
 
-    return [ep_summary for _window, ep_summary in episodes]
+    rows = db.execute(stmt).all()
+    return [
+        schemas.EpisodeSummary(
+            id=row.id,
+            title=row.title,
+            start_date=row.start_date,
+            end_date=row.end_date,
+            llm_summary=row.llm_summary,
+            pr_number=row.pr_number,
+            issue_number=row.issue_number,
+        )
+        for row in rows
+    ]
+
+
+def file_story_for_file(repo_id: int, file_path: str, db: Session) -> str | None:
+    """
+    Build 1-2 sentence high-level story for a file based on chronological episode summaries.
+
+    Returns None when there are no episodes, or when the Gemini call fails.
+    """
+    ep_summaries = episodes_for_file(repo_id=repo_id, file_path=file_path, db=db)
+    chronological = [ep.llm_summary for ep in ep_summaries if ep.llm_summary]
+    if not chronological:
+        return None
+
+    story = summarize_file_evolution(episodes_summaries=chronological)
+    if not story:
+        return None
+    if story.startswith("File story failed:"):
+        return None
+    return story

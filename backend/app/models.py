@@ -21,12 +21,16 @@ class Commit(Base):
     __tablename__ = "commits"
     id = Column(Integer, primary_key=True, index=True)
     repo_id = Column(Integer, ForeignKey("repos.id"))
+    pr_id = Column(Integer, ForeignKey("pull_requests.id"), nullable=True)
+    
     sha = Column(String, unique=True, index=True)
     author = Column(String)
     date = Column(DateTime)
     message = Column(Text)
 
     repo = relationship("Repo", back_populates="commits")
+    pr = relationship("PullRequest", back_populates="commits")
+
     file_changes = relationship("FileChange", back_populates="commit")
     episode_memberships = relationship("EpisodeMember", back_populates="commit")
 
@@ -42,6 +46,7 @@ class PullRequest(Base):
     merged_at = Column(DateTime)
 
     repo = relationship("Repo", back_populates="prs")
+    commits = relationship("Commit", back_populates="pr")
     episode_memberships = relationship("EpisodeMember", back_populates="pr")
 
 

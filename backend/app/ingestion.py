@@ -1,10 +1,11 @@
 from sqlalchemy.orm import Session
 from datetime import datetime
 import math
+import traceback
 
 from . import github_client, models
 from .database import SessionLocal
-
+from .episodes import build_and_persist_episodes
 
 def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
     """
@@ -125,10 +126,12 @@ def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
                 )
             )
             existing_issue_numbers.add(issue_number)
-
+        
+        build_and_persist_episodes(repo_id=target_repo.id, db=db)
         target_repo.status = "ready"
         db.commit()
     except Exception:
+        traceback.print_exc()
         db.rollback()
         if target_repo:
             target_repo.status = "error"

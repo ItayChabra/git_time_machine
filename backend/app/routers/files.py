@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from ..database import SessionLocal
 from .. import models, schemas
-from ..episodes import episodes_for_file
+from ..episodes import episodes_for_file, file_story_for_file
 
 router = APIRouter()
 
@@ -37,8 +37,9 @@ def get_file_story(repo_id: int, file_path: str = Query(...), db: Session = Depe
         raise HTTPException(status_code=404, detail="Repo not found")
 
     ep_summaries = episodes_for_file(repo_id=repo_id, file_path=file_path, db=db)
+    story = file_story_for_file(repo_id=repo_id, file_path=file_path, db=db)
     return schemas.FileStory(
         file_path=file_path,
         episodes=ep_summaries,
-        file_story_summary=None,
+        file_story_summary=story,
     )
