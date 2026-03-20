@@ -27,9 +27,12 @@ class EpisodeSummary(BaseModel):
     start_date: datetime
     end_date: datetime
     llm_summary: Optional[str] = None
+    pr_number: Optional[int] = None
+    issue_number: Optional[int] = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
+
 
 class FileStory(BaseModel):
     file_path: str
