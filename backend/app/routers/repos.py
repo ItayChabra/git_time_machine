@@ -47,6 +47,25 @@ def add_repo(
     return repo
 
 
+@router.post("/{repo_id}/refresh", response_model=schemas.RepoOut)
+def refresh_repo(
+    repo_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    repo = db.query(models.Repo).filter_by(id=repo_id).first()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    repo.status = "indexing"
+    db.commit()
+    db.refresh(repo)
+
+    background_tasks.add_task(ingest_repo_commits, repo.id, 20)
+
+    return repo
+
+
 @router.get("/", response_model=list[schemas.RepoOut])
 def list_repos(db: Session = Depends(get_db)):
     return db.query(models.Repo).all()
