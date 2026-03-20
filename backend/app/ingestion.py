@@ -1,26 +1,11 @@
 from sqlalchemy.orm import Session
 from datetime import datetime
 import math
-<<<<<<< HEAD
 import traceback
 
 from . import github_client, models
 from .database import SessionLocal
 from .episodes import build_and_persist_episodes
-=======
-import re
-
-from . import github_client, models
-from .database import SessionLocal
-
-ISSUE_REF_RE = re.compile(r"#(\d+)")
-
-def extract_issue_numbers(text: str | None) -> list[int]:
-    if not text:
-        return []
-    return [int(m) for m in ISSUE_REF_RE.findall(text)]
-
->>>>>>> git_time_machine/main
 
 def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
     db = SessionLocal()
@@ -147,34 +132,8 @@ def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
             db.flush()
             issue_number_to_obj[issue_number] = issue_obj
             existing_issue_numbers.add(issue_number)
-<<<<<<< HEAD
         
         build_and_persist_episodes(repo_id=target_repo.id, db=db)
-=======
-
-        # ── 5. Link commits/PRs → issues via #123 references ─────────────
-        all_issue_objs = {
-            **issue_number_to_obj,
-            **{
-                n: obj for n, obj in (
-                    (i.number, i)
-                    for i in db.query(models.Issue).filter_by(repo_id=target_repo.id).all()
-                )
-            }
-        }
-
-        for commit_obj in sha_to_commit_obj.values():
-            for issue_num in extract_issue_numbers(commit_obj.message):
-                issue_obj = all_issue_objs.get(issue_num)
-                if issue_obj:
-                    db.add(models.EpisodeMember(
-                        episode_id=None,  # no episode yet — placeholder linkage
-                        commit_id=commit_obj.id,
-                        issue_id=issue_obj.id,
-                        member_type="issue_ref",
-                    ))
-
->>>>>>> git_time_machine/main
         target_repo.status = "ready"
         db.commit()
 
