@@ -19,6 +19,7 @@ class Repo(Base):
 
 class Commit(Base):
     __tablename__ = "commits"
+    
     id = Column(Integer, primary_key=True, index=True)
     repo_id = Column(Integer, ForeignKey("repos.id"))
     pr_id = Column(Integer, ForeignKey("pull_requests.id"), nullable=True)
@@ -27,14 +28,13 @@ class Commit(Base):
     author = Column(String)
     date = Column(DateTime)
     message = Column(Text)
-    pr_id = Column(Integer, ForeignKey("pull_requests.id"), nullable=True)
 
+    # Relationships
     repo = relationship("Repo", back_populates="commits")
     pr = relationship("PullRequest", back_populates="commits")
-
+    
     file_changes = relationship("FileChange", back_populates="commit")
     episode_memberships = relationship("EpisodeMember", back_populates="commit")
-    pr = relationship("PullRequest", foreign_keys=[pr_id])
 
 
 class PullRequest(Base):
