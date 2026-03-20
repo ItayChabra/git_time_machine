@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import re
 from datetime import timedelta
 from typing import List
 
+<<<<<<< HEAD
 from sqlalchemy import and_, select
 from sqlalchemy.orm import aliased
 from sqlalchemy.orm import Session
@@ -142,14 +142,60 @@ def build_and_persist_episodes(repo_id: int, db: Session) -> None:
             db.add(models.EpisodeMember(episode_id=ep.id, issue_id=issue.id, member_type="issue"))
 
     db.commit()
+=======
+from sqlalchemy.orm import Session
+
+from . import models, schemas
+
+
+def _build_episode(
+    window_commits: list[models.Commit],
+    index: int,
+    db: Session,
+) -> schemas.EpisodeSummary:
+    ep_start = window_commits[0].date
+    ep_end = window_commits[-1].date
+    title = f"Changes by {window_commits[0].author or 'unknown'} on {ep_start.date().isoformat()}"
+    llm_summary = None
+
+    # Pure DB lookup — zero API calls
+    for commit in window_commits:
+        if commit.pr_id is not None:
+            pr = db.query(models.PullRequest).filter_by(id=commit.pr_id).first()
+            if pr:
+                title = f"PR #{pr.number}: {pr.title}"
+                llm_summary = (pr.body[:200] + "...") if pr.body else None
+                break
+
+    return schemas.EpisodeSummary(
+        id=index + 1,
+        title=title,
+        start_date=ep_start,
+        end_date=ep_end,
+        llm_summary=llm_summary,
+    )
+>>>>>>> git_time_machine/main
 
 
 def episodes_for_file(repo_id: int, file_path: str, db: Session) -> List[schemas.EpisodeSummary]:
     """
+<<<<<<< HEAD
     Reads persisted episodes that touch the given file, returns them sorted by date.
     """
     commit_ids_for_file = (
         select(models.Commit.id)
+=======
+    Build chronological EpisodeSummary list for a file within a repo.
+    Windowing rule: commits within 1 day of each other belong to the same episode.
+    All PR/issue context comes from the DB — no live API calls.
+    """
+    repo = db.query(models.Repo).filter_by(id=repo_id).first()
+    if not repo:
+        return []
+
+    commits = (
+        db.query(models.Commit)
+>>>>>>> git_time_machine/main
         .join(models.FileChange, models.FileChange.commit_id == models.Commit.id)
         .where(
             models.Commit.repo_id == repo_id,
@@ -158,6 +204,7 @@ def episodes_for_file(repo_id: int, file_path: str, db: Session) -> List[schemas
         .subquery()
     )
 
+<<<<<<< HEAD
     episode_ids_for_file = (
         select(models.EpisodeMember.episode_id)
         .where(
@@ -232,3 +279,32 @@ def file_story_for_file(repo_id: int, file_path: str, db: Session) -> str | None
     if story.startswith("File story failed:"):
         return None
     return story
+=======
+    # Deduplicate (join can produce multiple rows per commit if a file is touched multiple times)
+    seen: set[int] = set()
+    deduped: list[models.Commit] = []
+    for c in commits:
+        if c.id not in seen:
+            seen.add(c.id)
+            deduped.append(c)
+
+    if not deduped:
+        return []
+
+    episodes: list[schemas.EpisodeSummary] = []
+    window: list[models.Commit] = [deduped[0]]
+    window_end = deduped[0].date
+
+    for c in deduped[1:]:
+        if c.date is None or c.date - window_end <= timedelta(days=1):
+            window.append(c)
+            if c.date:
+                window_end = c.date
+        else:
+            episodes.append(_build_episode(window, len(episodes), db))
+            window = [c]
+            window_end = c.date
+
+    episodes.append(_build_episode(window, len(episodes), db))
+    return episodes
+>>>>>>> git_time_machine/main

@@ -18,13 +18,6 @@ class RepoOut(BaseModel):
         from_attributes = True
 
 
-class RepoListOut(BaseModel):
-    repos: List[RepoOut]
-
-    class Config:
-        from_attributes = True
-
-
 class FileEntry(BaseModel):
     path: str
 

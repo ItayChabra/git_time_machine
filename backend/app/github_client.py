@@ -74,3 +74,14 @@ class GitHubClient:
         resp.raise_for_status()
         data = resp.json()
         return data.get("files", [])
+    
+    def list_pr_commit_shas(self, owner: str, repo: str, pr_number: int) -> list[str]:
+        resp = requests.get(
+            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/commits",
+            headers=self._headers(),
+            params={"per_page": 100},
+        )
+        if resp.status_code != 200:
+            return []
+        return [c["sha"] for c in resp.json()]
+
