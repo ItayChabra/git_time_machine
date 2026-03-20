@@ -27,8 +27,9 @@ def _build_llm_context(window: list[models.Commit], pr: models.PullRequest | Non
 
 def build_and_persist_episodes(repo_id: int, db: Session) -> None:
     """
-    Groups commits per file into time-windowed episodes, calls LLM per episode,
-    and persists Episode + EpisodeMember rows. Safe to re-run (clears old rows first).
+    Groups commits per file into episodes (by PR first, then time-windowed for raw commits), 
+    calls LLM per episode, and persists Episode + EpisodeMember rows. 
+    Safe to re-run (clears old rows first).
     """
     # Clear existing episodes for this repo
     old_eps = db.query(models.Episode).filter_by(repo_id=repo_id).all()
@@ -48,20 +49,40 @@ def build_and_persist_episodes(repo_id: int, db: Session) -> None:
     if not commits:
         return
 
-    # Group commits into windows (1-day gap = new episode)
+    # --- NEW EPISODE GROUPING ---
     windows: list[list[models.Commit]] = []
-    window: list[models.Commit] = [commits[0]]
-    window_end = commits[0].date
-
-    for c in commits[1:]:
-        if c.date - window_end <= timedelta(days=1):
-            window.append(c)
-            window_end = c.date
+    
+    # Separate PR-linked commits from raw/unlinked commits
+    commits_by_pr: dict[int, list[models.Commit]] = {}
+    unlinked_commits: list[models.Commit] = []
+    
+    for c in commits:
+        if c.pr_id is not None:
+            commits_by_pr.setdefault(c.pr_id, []).append(c)
         else:
-            windows.append(window)
-            window = [c]
-            window_end = c.date
-    windows.append(window)
+            unlinked_commits.append(c)
+
+    # Add each PR as its own distinct isolated episode window
+    for pr_id, pr_commits in commits_by_pr.items():
+        windows.append(pr_commits)
+
+    # Apply the 1-day temporal gap ONLY to unlinked, raw commits
+    if unlinked_commits:
+        window = [unlinked_commits[0]]
+        window_end = unlinked_commits[0].date
+
+        for c in unlinked_commits[1:]:
+            if c.date - window_end <= timedelta(days=1):
+                window.append(c)
+                window_end = c.date
+            else:
+                windows.append(window)
+                window = [c]
+                window_end = c.date
+        windows.append(window)
+
+    # Sort all resulting windows chronologically by their first commit
+    windows.sort(key=lambda w: w[0].date)
 
     for window_commits in windows:
         pr: models.PullRequest | None = None
