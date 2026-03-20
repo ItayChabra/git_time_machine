@@ -39,3 +39,9 @@ class FileStory(BaseModel):
     episodes: List[EpisodeSummary]
     file_story_summary: Optional[str] = None
 
+
+class BlameStory(BaseModel):
+    sha: str
+    episode: Optional[EpisodeSummary] = None
+    # None means the commit exists but has no episode yet (e.g. ingestion still running)
+    # 404 means the SHA is not in the DB at all
