@@ -1,11 +1,41 @@
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timedelta
 import math
 import traceback
 
 from . import github_client, models
 from .database import SessionLocal
 from .episodes import build_and_persist_episodes
+
+
+def _heuristic_link_commits(db: Session, repo_id: int, sha_to_commit_obj: dict) -> None:
+    """
+    Pre-linking step: for any commit still missing pr_id, attempt to associate
+    it with a PR by looking for the earliest merged PR within 24 hours after
+    the commit date. Runs in ingestion so episodes.py can trust pr_id.
+
+    The fallback heuristic in episodes.py still handles merge commits that the
+    GitHub PR commits API misses (they won't have pr_id set after this either).
+    """
+    for sha, commit_obj in sha_to_commit_obj.items():
+        if commit_obj.pr_id is not None:
+            continue
+
+        pr_match = (
+            db.query(models.PullRequest)
+            .filter_by(repo_id=repo_id)
+            .filter(models.PullRequest.merged_at.isnot(None))
+            .filter(models.PullRequest.merged_at >= commit_obj.date)
+            .filter(models.PullRequest.merged_at <= commit_obj.date + timedelta(hours=24))
+            .order_by(models.PullRequest.merged_at.asc())
+            .first()
+        )
+
+        if pr_match:
+            commit_obj.pr_id = pr_match.id
+
+    db.flush()
+
 
 def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
     db = SessionLocal()
@@ -33,13 +63,19 @@ def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
             if not commit_date:
                 continue
 
+            # Idempotency guard: skip if this SHA is already in the DB
+            existing_commit = db.query(models.Commit).filter_by(sha=c["sha"]).first()
+            if existing_commit:
+                sha_to_commit_obj[c["sha"]] = existing_commit
+                continue
+
             commit_obj = models.Commit(
                 repo_id=target_repo.id,
                 sha=c["sha"],
                 author=(c.get("commit", {}).get("author", {}) or {}).get("name"),
                 date=datetime.fromisoformat(commit_date.replace("Z", "+00:00")),
                 message=c["commit"]["message"],
-                pr_id=None,  # filled in step 3
+                pr_id=None,  # filled in steps 3 and 3b
             )
             db.add(commit_obj)
             db.flush()
@@ -101,6 +137,12 @@ def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
                 if commit_obj and commit_obj.pr_id is None:
                     commit_obj.pr_id = pr_obj.id
 
+        # ── 3b. Heuristic pre-linking for commits still missing pr_id ─────
+        # Catches commits the GitHub API misses (e.g. fast-forward merges).
+        # Merge commits that are still unlinked after this are handled by the
+        # fallback heuristic in episodes.py.
+        _heuristic_link_commits(db=db, repo_id=target_repo.id, sha_to_commit_obj=sha_to_commit_obj)
+
         # ── 4. Ingest issues ──────────────────────────────────────────────
         existing_issue_numbers = {
             n[0] for n in db.query(models.Issue.number)
@@ -132,7 +174,7 @@ def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
             db.flush()
             issue_number_to_obj[issue_number] = issue_obj
             existing_issue_numbers.add(issue_number)
-        
+
         build_and_persist_episodes(repo_id=target_repo.id, db=db)
         target_repo.status = "ready"
         db.commit()
