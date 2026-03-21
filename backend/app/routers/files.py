@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, select
 from sqlalchemy.orm import aliased, Session
+import re
 from ..database import SessionLocal
 from .. import models, schemas
 from ..episodes import episodes_for_file, file_story_for_file
@@ -14,6 +15,51 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def _extract_hunk_for_line(patch: str, original_line: int) -> tuple[str, bool]:
+    """
+    Parse a unified diff and return the hunk that contains original_line.
+
+    original_line is the line number in the file AT THE TIME OF THE COMMIT,
+    as reported by `git blame --porcelain` (the second field on line 1).
+    This is stable — it does not drift as the file changes after the commit.
+
+    Returns (hunk_text, is_scoped) where is_scoped=True means we found the
+    exact hunk, False means we fell back to the full patch.
+    """
+    if not patch or not original_line:
+        return patch, False
+
+    current_hunk_header = None
+    current_hunk_lines: list[str] = []
+    # (old_start, old_count, hunk_lines)
+    hunks: list[tuple[int, int, list[str]]] = []
+
+    for line in patch.split("\n"):
+        m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+        if m:
+            # Save previous hunk
+            if current_hunk_header is not None:
+                old_start = current_hunk_header[0]
+                old_count = current_hunk_header[1]
+                hunks.append((old_start, old_count, current_hunk_lines))
+            current_hunk_header = (int(m.group(1)), int(m.group(2) or 1))
+            current_hunk_lines = [line]
+        elif current_hunk_header is not None:
+            current_hunk_lines.append(line)
+
+    # Save last hunk
+    if current_hunk_header is not None:
+        hunks.append((current_hunk_header[0], current_hunk_header[1], current_hunk_lines))
+
+    # Find the hunk whose old-file range contains original_line
+    for old_start, old_count, hunk_lines in hunks:
+        if old_start <= original_line <= old_start + old_count:
+            return "\n".join(hunk_lines), True
+
+    # Fallback: no hunk matched, return full patch
+    return patch, False
 
 
 @router.get("/{repo_id}/list", response_model=list[schemas.FileEntry])
@@ -51,17 +97,19 @@ def get_file_story(repo_id: int, file_path: str = Query(...), db: Session = Depe
 def get_blame_story(
     repo_id: int,
     sha: str = Query(...),
-    file_path: str = Query(None),  # optional: enables file-scoped patch explanation
+    file_path: str = Query(None),
+    original_line: int = Query(None),  # original line number from git blame --porcelain
     db: Session = Depends(get_db),
 ):
     """
-    Given a commit SHA (from git blame) and optionally a file path, return:
-    - file_explanation: a file-scoped LLM answer about why those lines changed
-      (only when file_path is provided and a patch is stored for that file)
-    - episode: the PR-level episode as fallback context
+    Core hover endpoint. Given a commit SHA, file path, and original line number
+    (all from git blame --porcelain), returns a hunk-scoped explanation of why
+    that specific code exists and whether it is safe to change.
 
-    The VS Code extension sends both sha and file_path so the hover tooltip is
-    specific to the file being viewed, not a generic PR summary.
+    Precision hierarchy:
+      1. Hunk-scoped (original_line + file_path + patch) — most specific
+      2. File-scoped (file_path + patch, no line) — fallback
+      3. Episode-level summary (no patch stored) — last resort
     """
     repo = db.query(models.Repo).filter_by(id=repo_id).first()
     if not repo:
@@ -76,7 +124,7 @@ def get_blame_story(
     if not commit:
         raise HTTPException(status_code=404, detail=f"Commit {sha} not found in repo")
 
-    # ── File-scoped patch explanation ──────────────────────────────────────
+    # ── Hunk or file-scoped patch explanation ─────────────────────────────
     file_explanation: str | None = None
 
     if file_path:
@@ -87,13 +135,22 @@ def get_blame_story(
         )
 
         if file_change and file_change.patch:
-            pr = commit.pr  # may be None for unlinked commits
+            pr = commit.pr
+
+            if original_line:
+                # Best case: extract just the hunk the developer is looking at
+                hunk, is_scoped = _extract_hunk_for_line(file_change.patch, original_line)
+            else:
+                # No line info: use the full patch
+                hunk, is_scoped = file_change.patch, False
+
             file_explanation = explain_line_change(
                 file_path=file_path,
-                patch=file_change.patch,
+                hunk=hunk,
                 commit_message=commit.message or "",
                 pr_title=pr.title if pr else None,
                 pr_body=pr.body if pr else None,
+                is_hunk_scoped=is_scoped,
             )
 
     # ── Episode (PR-level fallback context) ───────────────────────────────
