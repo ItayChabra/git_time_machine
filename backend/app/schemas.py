@@ -42,6 +42,9 @@ class FileStory(BaseModel):
 
 class BlameStory(BaseModel):
     sha: str
+    file_path: Optional[str] = None
+    # file_explanation: patch-aware, file-scoped LLM answer (the hover tooltip)
+    # None when no patch is stored for this file (binary, large diff, or old ingestion)
+    file_explanation: Optional[str] = None
+    # episode: fallback PR-level context, always shown if episode exists
     episode: Optional[EpisodeSummary] = None
-    # None means the commit exists but has no episode yet (e.g. ingestion still running)
-    # 404 means the SHA is not in the DB at all
