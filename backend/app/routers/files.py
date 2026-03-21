@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, select
 from sqlalchemy.orm import aliased, Session
+import re
 from ..database import SessionLocal
 from .. import models, schemas
 from ..episodes import episodes_for_file, file_story_for_file
@@ -8,12 +9,59 @@ from ..llm import explain_line_change
 
 router = APIRouter()
 
+# ── In-process hunk-level explanation cache ───────────────────────────────────
+# Keyed by (repo_id, sha_prefix, file_path, hunk_start).
+# Prevents multiple Gemini calls when the user hovers over different lines
+# that fall inside the same diff hunk.
+_explanation_cache: dict[tuple, str] = {}
+
+
 def get_db():
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
+
+def _extract_hunk_for_line(patch: str, original_line: int) -> tuple[str, int | None, int | None, bool]:
+    """
+    Parse a unified diff and return the hunk that contains original_line.
+
+    Returns (hunk_text, hunk_start, hunk_end, is_scoped) where:
+      - hunk_start: old-file start line from @@ -start,count @@
+      - hunk_end:   hunk_start + count (inclusive end of the old-file range)
+      - is_scoped:  True if we found the exact hunk, False if full patch fallback
+
+    The extension uses hunk_start + hunk_end to check future originalLine values
+    against cached hunks without making another API call.
+    """
+    if not patch or not original_line:
+        return patch, None, None, False
+
+    current_header: tuple[int, int] | None = None
+    current_lines: list[str] = []
+    hunks: list[tuple[int, int, list[str]]] = []  # (old_start, old_count, lines)
+
+    for line in patch.split("\n"):
+        m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+        if m:
+            if current_header is not None:
+                hunks.append((current_header[0], current_header[1], current_lines))
+            current_header = (int(m.group(1)), int(m.group(2) or 1))
+            current_lines = [line]
+        elif current_header is not None:
+            current_lines.append(line)
+
+    if current_header is not None:
+        hunks.append((current_header[0], current_header[1], current_lines))
+
+    for old_start, old_count, hunk_lines in hunks:
+        hunk_end = old_start + old_count
+        if old_start <= original_line <= hunk_end:
+            return "\n".join(hunk_lines), old_start, hunk_end, True
+
+    return patch, None, None, False
 
 
 @router.get("/{repo_id}/list", response_model=list[schemas.FileEntry])
@@ -51,17 +99,14 @@ def get_file_story(repo_id: int, file_path: str = Query(...), db: Session = Depe
 def get_blame_story(
     repo_id: int,
     sha: str = Query(...),
-    file_path: str = Query(None),  # optional: enables file-scoped patch explanation
+    file_path: str = Query(None),
+    original_line: int = Query(None),
     db: Session = Depends(get_db),
 ):
     """
-    Given a commit SHA (from git blame) and optionally a file path, return:
-    - file_explanation: a file-scoped LLM answer about why those lines changed
-      (only when file_path is provided and a patch is stored for that file)
-    - episode: the PR-level episode as fallback context
-
-    The VS Code extension sends both sha and file_path so the hover tooltip is
-    specific to the file being viewed, not a generic PR summary.
+    Core hover endpoint. Returns hunk_start + hunk_end so the extension can
+    cache at the hunk level — checking future originalLine values against the
+    known range without making additional API calls.
     """
     repo = db.query(models.Repo).filter_by(id=repo_id).first()
     if not repo:
@@ -76,8 +121,10 @@ def get_blame_story(
     if not commit:
         raise HTTPException(status_code=404, detail=f"Commit {sha} not found in repo")
 
-    # ── File-scoped patch explanation ──────────────────────────────────────
+    # ── File-scoped / hunk-scoped explanation ─────────────────────────────
     file_explanation: str | None = None
+    hunk_start: int | None = None
+    hunk_end: int | None = None
 
     if file_path:
         file_change = (
@@ -87,14 +134,28 @@ def get_blame_story(
         )
 
         if file_change and file_change.patch:
-            pr = commit.pr  # may be None for unlinked commits
-            file_explanation = explain_line_change(
-                file_path=file_path,
-                patch=file_change.patch,
-                commit_message=commit.message or "",
-                pr_title=pr.title if pr else None,
-                pr_body=pr.body if pr else None,
-            )
+            pr = commit.pr
+
+            if original_line:
+                hunk, hunk_start, hunk_end, is_scoped = _extract_hunk_for_line(
+                    file_change.patch, original_line
+                )
+            else:
+                hunk, hunk_start, hunk_end, is_scoped = file_change.patch, None, None, False
+
+            cache_key = (repo_id, sha[:8], file_path, hunk_start)
+            if cache_key in _explanation_cache:
+                file_explanation = _explanation_cache[cache_key]
+            else:
+                file_explanation = explain_line_change(
+                    file_path=file_path,
+                    hunk=hunk,
+                    commit_message=commit.message or "",
+                    pr_title=pr.title if pr else None,
+                    pr_body=pr.body if pr else None,
+                    is_hunk_scoped=is_scoped,
+                )
+                _explanation_cache[cache_key] = file_explanation
 
     # ── Episode (PR-level fallback context) ───────────────────────────────
     pr_member = aliased(models.EpisodeMember)
@@ -138,7 +199,6 @@ def get_blame_story(
     )
 
     row = db.execute(stmt).first()
-
     episode = None
     if row:
         episode = schemas.EpisodeSummary(
@@ -154,6 +214,8 @@ def get_blame_story(
     return schemas.BlameStory(
         sha=sha,
         file_path=file_path,
+        hunk_start=hunk_start,
+        hunk_end=hunk_end,
         file_explanation=file_explanation,
         episode=episode,
     )

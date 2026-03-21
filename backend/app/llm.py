@@ -9,7 +9,6 @@ DISABLE_LLM = os.getenv("DISABLE_LLM", "0").strip().lower() in {"1", "true", "ye
 
 MODEL_ID = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
-# Create the Gemini client only when enabled; this avoids failures in local dev.
 client = None
 if not DISABLE_LLM:
     client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
@@ -122,17 +121,22 @@ def summarize_file_evolution(episodes_summaries: list[str]) -> str:
 
 def explain_line_change(
     file_path: str,
-    patch: str,
+    hunk: str,
     commit_message: str,
     pr_title: str | None,
     pr_body: str | None,
+    is_hunk_scoped: bool = False,
 ) -> str:
     """
-    Given the diff for a specific file in a specific commit, explain why
-    those exact lines were changed. This is the core of the hover tooltip —
-    scoped to the file the developer is actually looking at, not the whole PR.
+    Explain why a specific block of code exists and whether it is safe to change.
 
-    Returns an explanation string, or a controlled "Explanation failed: ..." message.
+    When is_hunk_scoped=True, the hunk was extracted for the exact lines the
+    developer is hovering over. When False, it is the full file patch (fallback).
+
+    The prompt is designed to answer the three questions a developer actually has:
+      1. What constraint or bug does this code encode?
+      2. What breaks if I remove or change it?
+      3. Is it safe to modify, and what must I preserve if I do?
     """
     if DISABLE_LLM:
         return "LLM disabled in this environment"
@@ -140,26 +144,31 @@ def explain_line_change(
     if client is None:
         return "Explanation failed: LLM client not configured (missing GEMINI_API_KEY)"
 
-    # Truncate patch strictly to avoid context window issues on large diffs.
-    # 3000 chars covers most real-world file changes without blowing the token budget.
-    patch_truncated = _truncate(patch, 3000)
+    hunk_truncated = _truncate(hunk, 2000)
     commit_message_truncated = _truncate(commit_message, 300)
     pr_title_truncated = _truncate(pr_title, 140)
-    pr_body_truncated = _truncate(pr_body, 800)
+    pr_body_truncated = _truncate(pr_body, 600)
+
+    scope_note = (
+        "The diff below is scoped to the exact lines the developer is hovering over."
+        if is_hunk_scoped
+        else "The diff below covers all changes to this file in this commit."
+    )
 
     prompt = (
-        f"A developer is hovering over a line in `{file_path}` and wants to know "
-        f"why this change was made.\n\n"
-        f"Answer in 2-3 sentences. Be specific to this file and this diff — "
-        f"not a generic PR summary. Focus on:\n"
-        f"1) What specifically changed in this file\n"
-        f"2) Why — what bug, requirement, or constraint drove it\n"
-        f"3) Whether it is safe to modify (if inferable)\n\n"
-        f"File: {file_path}\n"
+        f"A developer is reading `{file_path}` and wants to understand the code "
+        f"they are looking at before deciding whether to change it.\n\n"
+        f"{scope_note}\n\n"
+        f"Answer in 3 short sentences — one per question. Be concrete and specific.\n"
+        f"1) What constraint, bug, or requirement does this specific code encode? "
+        f"   (Not just what it does — why it has to be this way.)\n"
+        f"2) What would break or regress if a developer removed or changed this?\n"
+        f"3) Is it safe to modify? If yes, what must be preserved. "
+        f"   If no, what makes it dangerous to touch.\n\n"
         f"Commit message: {commit_message_truncated}\n"
         f"PR title: {pr_title_truncated}\n"
         f"PR description: {pr_body_truncated}\n\n"
-        f"Diff:\n{patch_truncated}\n"
+        f"Diff:\n{hunk_truncated}\n"
     )
 
     max_attempts = 3
