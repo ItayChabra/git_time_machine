@@ -43,10 +43,10 @@ class FileStory(BaseModel):
 class BlameStory(BaseModel):
     sha: str
     file_path: Optional[str] = None
-    # hunk_start / hunk_end: the old-file line range of the matched hunk.
-    # The extension uses these to check if a new originalLine falls in an
-    # already-cached hunk, avoiding redundant API calls entirely.
-    hunk_start: Optional[int] = None
-    hunk_end: Optional[int] = None
+    # function_name: the VS Code symbol name containing the hovered line.
+    # Returned so the extension can cache at the semantic function level.
+    # None when the hovered line was outside any symbol (global scope)
+    # and hunk-based fallback was used instead.
+    function_name: Optional[str] = None
     file_explanation: Optional[str] = None
     episode: Optional[EpisodeSummary] = None

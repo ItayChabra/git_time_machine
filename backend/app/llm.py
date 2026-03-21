@@ -28,14 +28,29 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return ("RESOURCE_EXHAUSTED" in msg) or ("429" in msg) or ("RATE LIMIT" in msg)
 
 
+def _call_llm(prompt: str, max_attempts: int = 3) -> str | None:
+    """
+    Shared LLM call with retry/backoff. Returns response text or None on failure.
+    """
+    if DISABLE_LLM or client is None:
+        return None
+
+    backoff_seconds = [30, 60, 120]
+    for attempt_idx in range(max_attempts):
+        try:
+            response = client.models.generate_content(model=MODEL_ID, contents=prompt)
+            text = getattr(response, "text", None) or str(response)
+            return text.strip()
+        except Exception as e:
+            if not _is_rate_limit_error(e):
+                return None
+            time.sleep(backoff_seconds[attempt_idx])
+    return None
+
+
 def summarize_episode(context: Dict[str, Any]) -> str:
-    """
-    Summarize an episode with Gemini, with retry/backoff on rate limits.
-    Returns a compact success string, or a controlled "Summary failed: ..." message.
-    """
     if DISABLE_LLM:
         return "LLM disabled in this environment"
-
     if client is None:
         return "Summary failed: LLM client not configured (missing GEMINI_API_KEY)"
 
@@ -57,31 +72,13 @@ def summarize_episode(context: Dict[str, Any]) -> str:
         f"Issue Body: {issue_body}\n"
     )
 
-    max_attempts = 4
-    backoff_seconds = [30, 60, 120, 240]
-
-    for attempt_idx in range(max_attempts):
-        try:
-            response = client.models.generate_content(model=MODEL_ID, contents=prompt)
-            text = getattr(response, "text", None) or str(response)
-            return text.strip()
-        except Exception as e:
-            if not _is_rate_limit_error(e):
-                return f"Summary failed: {str(e)}"
-            time.sleep(backoff_seconds[attempt_idx])
-            if attempt_idx == max_attempts - 1:
-                return "Summary failed: quota exhausted after retries"
-
-    return "Summary failed: quota exhausted after retries"
+    result = _call_llm(prompt, max_attempts=4)
+    return result or "Summary failed: quota exhausted after retries"
 
 
 def summarize_file_evolution(episodes_summaries: list[str]) -> str:
-    """
-    Summarize a file's evolution based on chronological episode summaries.
-    """
     if DISABLE_LLM:
         return "LLM disabled in this environment"
-
     if client is None:
         return "File story failed: LLM client not configured (missing GEMINI_API_KEY)"
 
@@ -100,90 +97,96 @@ def summarize_file_evolution(episodes_summaries: list[str]) -> str:
         f"{joined}\n"
     )
 
-    max_attempts = 3
-    backoff_seconds = [30, 60, 120]
-
-    for attempt_idx in range(max_attempts):
-        try:
-            response = client.models.generate_content(model=MODEL_ID, contents=prompt)
-            time.sleep(random.uniform(2.5, 4.5))
-            text = getattr(response, "text", None) or str(response)
-            return text.strip()
-        except Exception as e:
-            if not _is_rate_limit_error(e):
-                return f"File story failed: {str(e)}"
-            time.sleep(backoff_seconds[attempt_idx])
-            if attempt_idx == max_attempts - 1:
-                return "File story failed: quota exhausted after retries"
-
+    result = _call_llm(prompt)
+    if result:
+        time.sleep(random.uniform(2.5, 4.5))
+        return result
     return "File story failed: quota exhausted after retries"
 
 
-def explain_line_change(
+def explain_function(
+    file_path: str,
+    function_name: str,
+    patch: str,
+    commit_message: str,
+    pr_title: str | None,
+    pr_body: str | None,
+) -> str:
+    """
+    Explain why a specific named function/class was changed in this commit.
+
+    The function name comes from VS Code's symbol provider — it's the actual
+    symbol the developer is hovering inside, not a line number guess.
+    The full file patch is provided for context, but the prompt anchors the
+    LLM on the specific named symbol so it can't get distracted by adjacent code.
+
+    Answers the three questions developers actually need:
+      1. What constraint/bug/requirement does this code encode?
+      2. What breaks if you remove or change it?
+      3. Is it safe to modify, and what must be preserved?
+    """
+    if DISABLE_LLM or client is None:
+        return "LLM disabled in this environment"
+
+    patch_truncated = _truncate(patch, 3000)
+    commit_truncated = _truncate(commit_message, 300)
+    pr_title_truncated = _truncate(pr_title, 140)
+    pr_body_truncated = _truncate(pr_body, 600)
+
+    prompt = (
+        f"A developer is hovering inside the function/class `{function_name}` "
+        f"in `{file_path}` and wants to understand why this code exists.\n\n"
+        f"Focus ONLY on `{function_name}`. Ignore other functions in the diff.\n\n"
+        f"Answer in 3 sentences — one per question:\n"
+        f"1) What constraint, bug, or requirement does `{function_name}` encode? "
+        f"   (Not just what it does — why it has to exist this way.)\n"
+        f"2) What would break or regress if a developer removed or changed it?\n"
+        f"3) Is it safe to modify? If yes, what must be preserved. "
+        f"   If no, what makes it dangerous to touch.\n\n"
+        f"Commit message: {commit_truncated}\n"
+        f"PR title: {pr_title_truncated}\n"
+        f"PR description: {pr_body_truncated}\n\n"
+        f"Diff (full file patch — focus only on `{function_name}`):\n"
+        f"{patch_truncated}\n"
+    )
+
+    result = _call_llm(prompt)
+    return result or "Explanation failed: quota exhausted after retries"
+
+
+def explain_hunk(
     file_path: str,
     hunk: str,
     commit_message: str,
     pr_title: str | None,
     pr_body: str | None,
-    is_hunk_scoped: bool = False,
 ) -> str:
     """
-    Explain why a specific block of code exists and whether it is safe to change.
-
-    When is_hunk_scoped=True, the hunk was extracted for the exact lines the
-    developer is hovering over. When False, it is the full file patch (fallback).
-
-    The prompt is designed to answer the three questions a developer actually has:
-      1. What constraint or bug does this code encode?
-      2. What breaks if I remove or change it?
-      3. Is it safe to modify, and what must I preserve if I do?
+    Fallback for when no VS Code symbol was found (global scope, blank lines,
+    unsupported language). Explains the hunk without a function anchor.
+    Same three-question format as explain_function.
     """
-    if DISABLE_LLM:
+    if DISABLE_LLM or client is None:
         return "LLM disabled in this environment"
 
-    if client is None:
-        return "Explanation failed: LLM client not configured (missing GEMINI_API_KEY)"
-
-    hunk_truncated = _truncate(hunk, 2000)
-    commit_message_truncated = _truncate(commit_message, 300)
+    hunk_truncated = _truncate(hunk, 3000)
+    commit_truncated = _truncate(commit_message, 300)
     pr_title_truncated = _truncate(pr_title, 140)
     pr_body_truncated = _truncate(pr_body, 600)
 
-    scope_note = (
-        "The diff below is scoped to the exact lines the developer is hovering over."
-        if is_hunk_scoped
-        else "The diff below covers all changes to this file in this commit."
-    )
-
     prompt = (
-        f"A developer is reading `{file_path}` and wants to understand the code "
-        f"they are looking at before deciding whether to change it.\n\n"
-        f"{scope_note}\n\n"
-        f"Answer in 3 short sentences — one per question. Be concrete and specific.\n"
-        f"1) What constraint, bug, or requirement does this specific code encode? "
-        f"   (Not just what it does — why it has to be this way.)\n"
-        f"2) What would break or regress if a developer removed or changed this?\n"
+        f"A developer is reading `{file_path}` and wants to understand "
+        f"the code they are looking at before deciding whether to change it.\n\n"
+        f"Answer in 3 sentences — one per question:\n"
+        f"1) What constraint, bug, or requirement does this code encode?\n"
+        f"2) What would break or regress if it were removed or changed?\n"
         f"3) Is it safe to modify? If yes, what must be preserved. "
         f"   If no, what makes it dangerous to touch.\n\n"
-        f"Commit message: {commit_message_truncated}\n"
+        f"Commit message: {commit_truncated}\n"
         f"PR title: {pr_title_truncated}\n"
         f"PR description: {pr_body_truncated}\n\n"
         f"Diff:\n{hunk_truncated}\n"
     )
 
-    max_attempts = 3
-    backoff_seconds = [30, 60, 120]
-
-    for attempt_idx in range(max_attempts):
-        try:
-            response = client.models.generate_content(model=MODEL_ID, contents=prompt)
-            text = getattr(response, "text", None) or str(response)
-            return text.strip()
-        except Exception as e:
-            if not _is_rate_limit_error(e):
-                return f"Explanation failed: {str(e)}"
-            time.sleep(backoff_seconds[attempt_idx])
-            if attempt_idx == max_attempts - 1:
-                return "Explanation failed: quota exhausted after retries"
-
-    return "Explanation failed: quota exhausted after retries"
+    result = _call_llm(prompt)
+    return result or "Explanation failed: quota exhausted after retries"
