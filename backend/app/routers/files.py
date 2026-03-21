@@ -13,8 +13,6 @@ router = APIRouter()
 # Keyed by (repo_id, sha_prefix, file_path, hunk_start).
 # Prevents multiple Gemini calls when the user hovers over different lines
 # that fall inside the same diff hunk.
-# Fine for local dev (single uvicorn process). For multi-worker deployments,
-# replace with Redis or a shared cache layer.
 _explanation_cache: dict[tuple, str] = {}
 
 
@@ -26,46 +24,44 @@ def get_db():
         db.close()
 
 
-def _extract_hunk_for_line(patch: str, original_line: int) -> tuple[str, int | None, bool]:
+def _extract_hunk_for_line(patch: str, original_line: int) -> tuple[str, int | None, int | None, bool]:
     """
     Parse a unified diff and return the hunk that contains original_line.
 
-    original_line is the line number in the file AT THE TIME OF THE COMMIT,
-    as reported by `git blame --porcelain` (the second field on line 1).
-    This is stable — it does not drift as the file changes after the commit.
+    Returns (hunk_text, hunk_start, hunk_end, is_scoped) where:
+      - hunk_start: old-file start line from @@ -start,count @@
+      - hunk_end:   hunk_start + count (inclusive end of the old-file range)
+      - is_scoped:  True if we found the exact hunk, False if full patch fallback
 
-    Returns (hunk_text, hunk_start, is_scoped) where:
-      - hunk_start is the old-file start line from @@ -start,count @@
-        (used as a stable cache key by the extension)
-      - is_scoped=True means we found the exact hunk
-      - is_scoped=False means we fell back to the full patch
+    The extension uses hunk_start + hunk_end to check future originalLine values
+    against cached hunks without making another API call.
     """
     if not patch or not original_line:
-        return patch, None, False
+        return patch, None, None, False
 
-    current_hunk_header: tuple[int, int] | None = None
-    current_hunk_lines: list[str] = []
+    current_header: tuple[int, int] | None = None
+    current_lines: list[str] = []
     hunks: list[tuple[int, int, list[str]]] = []  # (old_start, old_count, lines)
 
     for line in patch.split("\n"):
         m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
         if m:
-            if current_hunk_header is not None:
-                hunks.append((current_hunk_header[0], current_hunk_header[1], current_hunk_lines))
-            current_hunk_header = (int(m.group(1)), int(m.group(2) or 1))
-            current_hunk_lines = [line]
-        elif current_hunk_header is not None:
-            current_hunk_lines.append(line)
+            if current_header is not None:
+                hunks.append((current_header[0], current_header[1], current_lines))
+            current_header = (int(m.group(1)), int(m.group(2) or 1))
+            current_lines = [line]
+        elif current_header is not None:
+            current_lines.append(line)
 
-    if current_hunk_header is not None:
-        hunks.append((current_hunk_header[0], current_hunk_header[1], current_hunk_lines))
+    if current_header is not None:
+        hunks.append((current_header[0], current_header[1], current_lines))
 
     for old_start, old_count, hunk_lines in hunks:
-        if old_start <= original_line <= old_start + old_count:
-            return "\n".join(hunk_lines), old_start, True
+        hunk_end = old_start + old_count
+        if old_start <= original_line <= hunk_end:
+            return "\n".join(hunk_lines), old_start, hunk_end, True
 
-    # No hunk matched — return full patch with no stable hunk_start
-    return patch, None, False
+    return patch, None, None, False
 
 
 @router.get("/{repo_id}/list", response_model=list[schemas.FileEntry])
@@ -108,17 +104,9 @@ def get_blame_story(
     db: Session = Depends(get_db),
 ):
     """
-    Core hover endpoint. Given a commit SHA, file path, and original line number
-    (all from git blame --porcelain), returns a hunk-scoped explanation of why
-    that specific code exists and whether it is safe to change.
-
-    Returns hunk_start so the extension can cache at the hunk level — all lines
-    in the same hunk share one explanation and one Gemini call.
-
-    Precision hierarchy:
-      1. Hunk-scoped (original_line + file_path + patch) — most specific
-      2. File-scoped (file_path + patch, no line) — fallback
-      3. Episode-level summary (no patch stored) — last resort
+    Core hover endpoint. Returns hunk_start + hunk_end so the extension can
+    cache at the hunk level — checking future originalLine values against the
+    known range without making additional API calls.
     """
     repo = db.query(models.Repo).filter_by(id=repo_id).first()
     if not repo:
@@ -136,6 +124,7 @@ def get_blame_story(
     # ── File-scoped / hunk-scoped explanation ─────────────────────────────
     file_explanation: str | None = None
     hunk_start: int | None = None
+    hunk_end: int | None = None
 
     if file_path:
         file_change = (
@@ -148,15 +137,12 @@ def get_blame_story(
             pr = commit.pr
 
             if original_line:
-                hunk, hunk_start, is_scoped = _extract_hunk_for_line(
+                hunk, hunk_start, hunk_end, is_scoped = _extract_hunk_for_line(
                     file_change.patch, original_line
                 )
             else:
-                hunk, hunk_start, is_scoped = file_change.patch, None, False
+                hunk, hunk_start, hunk_end, is_scoped = file_change.patch, None, None, False
 
-            # Check in-process cache before calling Gemini.
-            # Cache key uses hunk_start when available so all lines in the
-            # same hunk share a single cached explanation.
             cache_key = (repo_id, sha[:8], file_path, hunk_start)
             if cache_key in _explanation_cache:
                 file_explanation = _explanation_cache[cache_key]
@@ -213,7 +199,6 @@ def get_blame_story(
     )
 
     row = db.execute(stmt).first()
-
     episode = None
     if row:
         episode = schemas.EpisodeSummary(
@@ -230,6 +215,7 @@ def get_blame_story(
         sha=sha,
         file_path=file_path,
         hunk_start=hunk_start,
+        hunk_end=hunk_end,
         file_explanation=file_explanation,
         episode=episode,
     )
