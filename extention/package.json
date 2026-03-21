@@ -1,0 +1,45 @@
+{
+  "name": "git-time-machine",
+  "displayName": "Git Time Machine",
+  "description": "Hover over any line to see why it was written — powered by your Git history and AI.",
+  "version": "0.4.2",
+  "publisher": "ItayChabra",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["*"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "gitTimeMachine.clearCache",
+        "title": "Git Time Machine: Clear Cache"
+      }
+    ],
+    "configuration": {
+      "title": "Git Time Machine",
+      "properties": {
+        "gitTimeMachine.backendUrl": {
+          "type": "string",
+          "default": "http://localhost:8000",
+          "description": "URL of the Git Time Machine backend API"
+        },
+        "gitTimeMachine.repoId": {
+          "type": "number",
+          "default": 1,
+          "description": "Repo ID as returned by the backend when you ingested the repo"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.0.0"
+  }
+}
