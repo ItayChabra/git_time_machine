@@ -19,20 +19,18 @@ class Repo(Base):
 
 class Commit(Base):
     __tablename__ = "commits"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     repo_id = Column(Integer, ForeignKey("repos.id"))
     pr_id = Column(Integer, ForeignKey("pull_requests.id"), nullable=True)
-    
+
     sha = Column(String, unique=True, index=True)
     author = Column(String)
     date = Column(DateTime)
     message = Column(Text)
 
-    # Relationships
     repo = relationship("Repo", back_populates="commits")
     pr = relationship("PullRequest", back_populates="commits")
-    
     file_changes = relationship("FileChange", back_populates="commit")
     episode_memberships = relationship("EpisodeMember", back_populates="commit")
 
@@ -71,6 +69,7 @@ class FileChange(Base):
     commit_id = Column(Integer, ForeignKey("commits.id"))
     file_path = Column(String, index=True)
     change_type = Column(String)  # added/modified/deleted
+    patch = Column(Text, nullable=True)  # raw unified diff for this file; None for binary/large diffs
 
     commit = relationship("Commit", back_populates="file_changes")
 
@@ -82,7 +81,7 @@ class Episode(Base):
     title = Column(String)
     start_date = Column(DateTime)
     end_date = Column(DateTime)
-    llm_summary = Column(Text, nullable=True)  # later
+    llm_summary = Column(Text, nullable=True)
 
     repo = relationship("Repo", back_populates="episodes")
     members = relationship("EpisodeMember", back_populates="episode")

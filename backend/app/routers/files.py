@@ -4,6 +4,7 @@ from sqlalchemy.orm import aliased, Session
 from ..database import SessionLocal
 from .. import models, schemas
 from ..episodes import episodes_for_file, file_story_for_file
+from ..llm import explain_line_change
 
 router = APIRouter()
 
@@ -47,16 +48,25 @@ def get_file_story(repo_id: int, file_path: str = Query(...), db: Session = Depe
 
 
 @router.get("/{repo_id}/blame_story", response_model=schemas.BlameStory)
-def get_blame_story(repo_id: int, sha: str = Query(...), db: Session = Depends(get_db)):
+def get_blame_story(
+    repo_id: int,
+    sha: str = Query(...),
+    file_path: str = Query(None),  # optional: enables file-scoped patch explanation
+    db: Session = Depends(get_db),
+):
     """
-    Given a commit SHA (from git blame), return the episode that contains it.
-    This is the core endpoint for the VS Code hover feature:
-      hover over line → git blame gives SHA → call this → show episode summary
+    Given a commit SHA (from git blame) and optionally a file path, return:
+    - file_explanation: a file-scoped LLM answer about why those lines changed
+      (only when file_path is provided and a patch is stored for that file)
+    - episode: the PR-level episode as fallback context
+
+    The VS Code extension sends both sha and file_path so the hover tooltip is
+    specific to the file being viewed, not a generic PR summary.
     """
     repo = db.query(models.Repo).filter_by(id=repo_id).first()
     if not repo:
         raise HTTPException(status_code=404, detail="Repo not found")
- 
+
     commit = (
         db.query(models.Commit)
         .filter_by(repo_id=repo_id)
@@ -65,11 +75,31 @@ def get_blame_story(repo_id: int, sha: str = Query(...), db: Session = Depends(g
     )
     if not commit:
         raise HTTPException(status_code=404, detail=f"Commit {sha} not found in repo")
- 
-    # Find which episode this commit belongs to
+
+    # ── File-scoped patch explanation ──────────────────────────────────────
+    file_explanation: str | None = None
+
+    if file_path:
+        file_change = (
+            db.query(models.FileChange)
+            .filter_by(commit_id=commit.id, file_path=file_path)
+            .first()
+        )
+
+        if file_change and file_change.patch:
+            pr = commit.pr  # may be None for unlinked commits
+            file_explanation = explain_line_change(
+                file_path=file_path,
+                patch=file_change.patch,
+                commit_message=commit.message or "",
+                pr_title=pr.title if pr else None,
+                pr_body=pr.body if pr else None,
+            )
+
+    # ── Episode (PR-level fallback context) ───────────────────────────────
     pr_member = aliased(models.EpisodeMember)
     issue_member = aliased(models.EpisodeMember)
- 
+
     stmt = (
         select(
             models.Episode.id,
@@ -106,9 +136,9 @@ def get_blame_story(repo_id: int, sha: str = Query(...), db: Session = Depends(g
         .outerjoin(models.Issue, models.Issue.id == issue_member.issue_id)
         .limit(1)
     )
- 
+
     row = db.execute(stmt).first()
- 
+
     episode = None
     if row:
         episode = schemas.EpisodeSummary(
@@ -120,5 +150,10 @@ def get_blame_story(repo_id: int, sha: str = Query(...), db: Session = Depends(g
             pr_number=row.pr_number,
             issue_number=row.issue_number,
         )
- 
-    return schemas.BlameStory(sha=sha, episode=episode)
+
+    return schemas.BlameStory(
+        sha=sha,
+        file_path=file_path,
+        file_explanation=file_explanation,
+        episode=episode,
+    )

@@ -88,6 +88,7 @@ def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
                     commit_id=commit_obj.id,
                     file_path=f["filename"],
                     change_type=f.get("status", "modified"),
+                    patch=f.get("patch"),  # None for binary files or very large diffs
                 ))
 
         # ── 2. Ingest PRs ─────────────────────────────────────────────────
