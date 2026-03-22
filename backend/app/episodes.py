@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import bisect
 from datetime import timedelta
 from typing import List
 import re
+
 from sqlalchemy import and_, select
-from sqlalchemy.orm import aliased
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import aliased, Session
 
 from . import models, schemas
 from .llm import summarize_episode, summarize_file_evolution
@@ -15,7 +16,11 @@ def _parse_issue_numbers(text: str) -> list[int]:
     return [int(m) for m in re.findall(r"#(\d+)", text or "")]
 
 
-def _build_llm_context(window: list[models.Commit], pr: models.PullRequest | None, issue: models.Issue | None) -> dict:
+def _build_llm_context(
+    window: list[models.Commit],
+    pr: models.PullRequest | None,
+    issue: models.Issue | None,
+) -> dict:
     return {
         "pr_title": pr.title if pr else "",
         "pr_body": (pr.body[:600] if pr and pr.body else ""),
@@ -27,9 +32,9 @@ def _build_llm_context(window: list[models.Commit], pr: models.PullRequest | Non
 
 def build_and_persist_episodes(repo_id: int, db: Session) -> None:
     """
-    Groups commits per file into episodes (by PR first, then time-windowed for raw commits), 
-    calls LLM per episode, and persists Episode + EpisodeMember rows. 
-    Safe to re-run (clears old rows first).
+    Groups commits per file into episodes (by PR first, then time-windowed for
+    raw commits), calls LLM per episode, and persists Episode + EpisodeMember
+    rows. Safe to re-run (clears old rows first).
     """
     # Clear existing episodes for this repo
     old_eps = db.query(models.Episode).filter_by(repo_id=repo_id).all()
@@ -49,24 +54,42 @@ def build_and_persist_episodes(repo_id: int, db: Session) -> None:
     if not commits:
         return
 
-    # --- NEW EPISODE GROUPING ---
+    # ── Pre-load merged PRs once (avoids N+1 in the heuristic loop below) ──
+    merged_prs = (
+        db.query(models.PullRequest)
+        .filter_by(repo_id=repo_id)
+        .filter(models.PullRequest.merged_at.isnot(None))
+        .order_by(models.PullRequest.merged_at.asc())
+        .all()
+    )
+    merged_pr_times = [pr.merged_at for pr in merged_prs]
+
+    # ── Pre-load PR id → object map for direct PR lookups ──────────────────
+    pr_by_id: dict[int, models.PullRequest] = {pr.id: pr for pr in merged_prs}
+    # Also include non-merged PRs (linked commits may reference open PRs)
+    all_prs = (
+        db.query(models.PullRequest)
+        .filter_by(repo_id=repo_id)
+        .all()
+    )
+    for pr in all_prs:
+        pr_by_id.setdefault(pr.id, pr)
+
+    # ── Episode grouping ────────────────────────────────────────────────────
     windows: list[list[models.Commit]] = []
-    
-    # Separate PR-linked commits from raw/unlinked commits
+
     commits_by_pr: dict[int, list[models.Commit]] = {}
     unlinked_commits: list[models.Commit] = []
-    
+
     for c in commits:
         if c.pr_id is not None:
             commits_by_pr.setdefault(c.pr_id, []).append(c)
         else:
             unlinked_commits.append(c)
 
-    # Add each PR as its own distinct isolated episode window
     for pr_id, pr_commits in commits_by_pr.items():
         windows.append(pr_commits)
 
-    # Apply the 1-day temporal gap ONLY to unlinked, raw commits
     if unlinked_commits:
         window = [unlinked_commits[0]]
         window_end = unlinked_commits[0].date
@@ -81,43 +104,35 @@ def build_and_persist_episodes(repo_id: int, db: Session) -> None:
                 window_end = c.date
         windows.append(window)
 
-    # Sort all resulting windows chronologically by their first commit
     windows.sort(key=lambda w: w[0].date)
 
     for window_commits in windows:
         pr: models.PullRequest | None = None
         issue: models.Issue | None = None
 
-        # (a) If any commit in the window is already linked to a PR, use that PR and skip further lookup.
+        # (a) Direct pr_id link
         linked_commit = next((c for c in window_commits if c.pr_id is not None), None)
         if linked_commit is not None:
-            pr = db.query(models.PullRequest).filter_by(id=linked_commit.pr_id).first()
+            pr = pr_by_id.get(linked_commit.pr_id)
 
-        # (b) Otherwise, do a local DB heuristic to associate a PR to this episode's commits.
+        # (b) Heuristic: use preloaded list + bisect — O(log N) per window,
+        #     not one DB query per commit (was N+1).
         if pr is None:
-            # Heuristic window: "merged_at within 1 hour after commit date"
-            # plus a slightly larger window to approximate PR creation time (since we don't store it).
             approx_hours_after_commit = 24
-
             for c in window_commits:
-                # Only consider merged PRs.
-                pr_match = (
-                    db.query(models.PullRequest)
-                    .filter_by(repo_id=repo_id)
-                    .filter(models.PullRequest.merged_at.isnot(None))
-                    .filter(models.PullRequest.merged_at >= c.date)
-                    .filter(models.PullRequest.merged_at <= c.date + timedelta(hours=approx_hours_after_commit))
-                    .order_by(models.PullRequest.merged_at.asc())
-                    .first()
+                lo = bisect.bisect_left(merged_pr_times, c.date)
+                hi = bisect.bisect_right(
+                    merged_pr_times, c.date + timedelta(hours=approx_hours_after_commit)
                 )
-
-                if pr_match is None:
+                candidates = merged_prs[lo:hi]
+                if not candidates:
                     continue
 
-                # Cache association for future episodes.
+                pr_match = candidates[0]
                 c.pr_id = pr_match.id
                 db.flush()
                 pr = pr_match
+                pr_by_id[pr_match.id] = pr_match
                 break
 
         # Find linked issue via #number mentions
@@ -238,8 +253,7 @@ def episodes_for_file(repo_id: int, file_path: str, db: Session) -> List[schemas
 def file_story_for_file(repo_id: int, file_path: str, db: Session) -> str | None:
     """
     Build 1-2 sentence high-level story for a file based on chronological episode summaries.
-
-    Returns None when there are no episodes, or when the Gemini call fails.
+    Returns None when there are no episodes or when the LLM call fails.
     """
     ep_summaries = episodes_for_file(repo_id=repo_id, file_path=file_path, db=db)
     chronological = [ep.llm_summary for ep in ep_summaries if ep.llm_summary]

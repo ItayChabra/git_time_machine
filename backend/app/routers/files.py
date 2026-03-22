@@ -1,7 +1,9 @@
+from collections import OrderedDict
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, select
 from sqlalchemy.orm import aliased, Session
 import re
+
 from ..database import SessionLocal
 from .. import models, schemas
 from ..episodes import episodes_for_file, file_story_for_file
@@ -9,20 +11,42 @@ from ..llm import explain_function, explain_hunk
 
 router = APIRouter()
 
-# ── Explanation cache ─────────────────────────────────────────────────────────
+
+# ── Bounded LRU cache ─────────────────────────────────────────────────────────
+# Replaces plain module-level dicts which had no eviction and would grow
+# unboundedly over time. 1 000 entries per cache ≈ a few MB at most.
+# For multi-worker deployments, migrate these to Redis (already in docker-compose).
+
+class _LRUCache(OrderedDict):
+    """Simple bounded LRU cache backed by an OrderedDict."""
+
+    def __init__(self, maxsize: int = 1_000):
+        super().__init__()
+        self.maxsize = maxsize
+
+    def __setitem__(self, key, value):
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        if len(self) > self.maxsize:
+            self.popitem(last=False)  # evict least-recently used
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        self.move_to_end(key)  # mark as recently used
+        return value
+
+
 # Two separate caches with different key shapes:
 #
 # Function cache: (repo_id, sha, file_path, function_name)
 #   Used when VS Code symbol provider identified the enclosing function.
-#   One Gemini call per function per commit — all lines inside the same
-#   function share this entry. Semantically correct, no hunk bleed.
 #
 # Hunk cache: (repo_id, sha, file_path, hunk_start)
 #   Fallback for lines outside any symbol (global scope, decorators, etc.)
-#   Same behavior as v0.3.3.
 
-_function_cache: dict[tuple, str] = {}
-_hunk_cache: dict[tuple, str] = {}
+_function_cache: _LRUCache = _LRUCache(maxsize=1_000)
+_hunk_cache: _LRUCache = _LRUCache(maxsize=1_000)
 
 
 def get_db():
@@ -111,15 +135,8 @@ def get_blame_story(
 
     Precision hierarchy:
       1. Function-scoped (function_name from VS Code symbol provider)
-         Cache key: sha + file + function_name
-         LLM is explicitly anchored on the named symbol — no hunk bleed.
-
       2. Hunk-scoped fallback (original_line, no function_name)
-         Used when the line is outside any symbol (global scope, decorators).
-         Cache key: sha + file + hunk_start (v0.3.3 behavior)
-
-      3. Episode-level (no patch stored)
-         Last resort, returns PR-level summary.
+      3. Episode-level (no patch stored) — last resort
     """
     repo = db.query(models.Repo).filter_by(id=repo_id).first()
     if not repo:
@@ -148,20 +165,12 @@ def get_blame_story(
         if file_change and file_change.patch:
             pr = commit.pr
 
-            # Always extract the hunk for original_line first.
-            # For function-scoped path: pass the hunk (not full patch) so the
-            # LLM only sees the diff containing this function, not unrelated
-            # functions committed in the same changeset.
-            # For hunk fallback: same hunk used directly.
             hunk, hunk_start, _ = _extract_hunk_for_line(
                 file_change.patch, original_line or 1
             )
 
             if function_name and original_line:
-                # ── Path 1: Function-scoped (VS Code symbol provider) ──────
-                # Cache by function name — all lines inside share one entry.
-                # Send only the hunk containing original_line, not the full
-                # patch — prevents the LLM from reading adjacent functions.
+                # ── Path 1: Function-scoped ────────────────────────────────
                 cache_key = (repo_id, sha[:8], file_path, function_name)
                 if cache_key in _function_cache:
                     file_explanation = _function_cache[cache_key]
@@ -179,8 +188,6 @@ def get_blame_story(
 
             elif original_line:
                 # ── Path 2: Hunk-scoped fallback ───────────────────────────
-                # Line is outside any symbol (global scope, blank lines, etc.)
-                # or language server wasn't available.
                 if hunk_start is not None:
                     cache_key = (repo_id, sha[:8], file_path, hunk_start)
                     if cache_key in _hunk_cache:
