@@ -2,7 +2,7 @@
   "name": "git-time-machine",
   "displayName": "Git Time Machine",
   "description": "Hover over any line to see why it was written — powered by your Git history and AI.",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "publisher": "ItayChabra",
   "engines": {
     "vscode": "^1.85.0"
@@ -15,6 +15,10 @@
       {
         "command": "gitTimeMachine.clearCache",
         "title": "Git Time Machine: Clear Cache"
+      },
+      {
+        "command": "gitTimeMachine.ingestRepo",
+        "title": "Git Time Machine: Ingest Current Repo"
       }
     ],
     "configuration": {
@@ -23,12 +27,35 @@
         "gitTimeMachine.backendUrl": {
           "type": "string",
           "default": "http://localhost:8000",
-          "description": "URL of the Git Time Machine backend API"
+          "description": "URL of the Git Time Machine backend API."
         },
-        "gitTimeMachine.repoId": {
+        "gitTimeMachine.githubToken": {
+          "type": "string",
+          "default": "",
+          "description": "Your GitHub personal access token (needs repo read scope)."
+        },
+        "gitTimeMachine.geminiApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Your Google Gemini API key."
+        },
+        "gitTimeMachine.maxCommits": {
           "type": "number",
-          "default": 1,
-          "description": "Repo ID as returned by the backend when you ingested the repo"
+          "default": 200,
+          "minimum": 1,
+          "maximum": 5000,
+          "description": "How many commits to ingest when indexing a repo. Higher values give more coverage but take longer."
+        },
+        "gitTimeMachine.geminiModel": {
+          "type": "string",
+          "default": "gemini-3-flash-preview",
+          "enum": ["gemini-3-flash-preview", "gemini-2.0-flash", "gemini-2.0-flash-lite"],
+          "enumDescriptions": [
+              "Best quality explanations — latest Gemini 3 model (recommended).",
+              "Faster and cheaper — Gemini 2.0, slightly less precise.",
+              "Lightest and cheapest — lowest quota usage."
+          ],
+          "description": "Gemini model used for hover explanations."
         }
       }
     }
