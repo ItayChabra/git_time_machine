@@ -21,7 +21,7 @@ interface EpisodeSummary {
 interface BlameStory {
   sha: string;
   file_path: string | null;
-  function_name: string | null; // resolved symbol name, null if hunk fallback was used
+  function_name: string | null;
   file_explanation: string | null;
   episode: EpisodeSummary | null;
 }
@@ -29,7 +29,7 @@ interface BlameStory {
 // ── Git blame ────────────────────────────────────────────────────────────────
 
 interface BlameInfo {
-  sha: string;
+  sha: string;          // full 40-char SHA
   originalLine: number;
   repoRelativePath: string;
 }
@@ -48,7 +48,7 @@ async function getBlameInfo(
     );
 
     const firstLine = stdout.split("\n")[0].split(" ");
-    const sha = firstLine[0];
+    const sha = firstLine[0];           // full 40-char SHA from --porcelain
     const originalLine = parseInt(firstLine[1], 10);
 
     if (!sha || sha.length < 7 || isNaN(originalLine)) { return null; }
@@ -59,7 +59,9 @@ async function getBlameInfo(
       .replace(/\\/g, "/")
       .replace(/^\//, "");
 
-    return { sha: sha.slice(0, 8), originalLine, repoRelativePath };
+    // Return the full SHA — never truncate. Short SHAs can collide in large
+    // repos (Birthday Paradox; Git itself moved away from 7-char defaults).
+    return { sha, originalLine, repoRelativePath };
   } catch {
     return null;
   }
@@ -67,28 +69,11 @@ async function getBlameInfo(
 
 // ── VS Code symbol provider ───────────────────────────────────────────────────
 
-/**
- * Find the deepest symbol (function/method/class) containing the given line.
- *
- * Uses VS Code's built-in executeDocumentSymbolProvider — powered by whatever
- * language server is active (Pylance for Python, etc.). Zero dependencies.
- *
- * Returns the symbol name, or null if:
- *   - The line is in global scope (no enclosing symbol)
- *   - No language server is active for this file type
- *   - The symbol provider returns nothing
- *
- * In all null cases the caller falls back to hunk-based logic.
- */
 async function getEnclosingSymbol(
   document: vscode.TextDocument,
-  line: number // 0-based
+  line: number
 ): Promise<string | null> {
   try {
-    // executeDocumentSymbolProvider can return either:
-    //   DocumentSymbol[]     — has .range and .children (tree structure)
-    //   SymbolInformation[]  — has .location.range, no .children (flat list)
-    // Pylance may return either depending on version. We handle both.
     const symbols = await vscode.commands.executeCommand<
       (vscode.DocumentSymbol | vscode.SymbolInformation)[]
     >(
@@ -98,10 +83,6 @@ async function getEnclosingSymbol(
 
     if (!symbols || symbols.length === 0) { return null; }
 
-    // Only consider symbols that represent logical code blocks.
-    // Pylance also exposes parameters and variables as symbols with tiny ranges
-    // that would always win the smallest-range sort, giving us parameter names
-    // like repo_id instead of the enclosing function name.
     const BLOCK_KINDS = new Set([
       vscode.SymbolKind.Function,
       vscode.SymbolKind.Method,
@@ -187,7 +168,6 @@ function buildHoverContent(story: BlameStory): vscode.MarkdownString {
   md.supportHtml = true;
 
   if (story.file_explanation) {
-    // Show function name in title if we resolved one
     const title = story.function_name
       ? `Why \`${story.function_name}\` exists`
       : "Why this line exists";
@@ -221,19 +201,11 @@ function buildHoverContent(story: BlameStory): vscode.MarkdownString {
 }
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
-//
-// Two cache keys, mirroring the two backend paths:
+// In-process L1 cache — mirrors the DB-backed persistent cache on the backend.
+// Keys use the full SHA (no truncation) to avoid collision bugs.
 //
 // Function key:  repoId:sha:file:fn:functionName
-//   All lines inside the same named function share this entry.
-//   Correct because the backend anchored the LLM on that specific function.
-//   No bleed: two different functions in the same hunk get different keys.
-//
-// Hunk key:  repoId:sha:file:hunk:originalLine (set from backend response)
-//   Used for global-scope lines where no symbol was found.
-//   Falls back gracefully to v0.3.3 behavior.
-//
-// In-flight map prevents duplicate concurrent requests for the same exact line.
+// Line key:      repoId:sha:file:L:originalLine
 
 const cache = new Map<string, BlameStory | null>();
 const inFlight = new Map<string, Promise<BlameStory | null>>();
@@ -253,11 +225,9 @@ async function getOrFetch(
   repoRelativePath: string,
   originalLine: number,
   functionName: string | null,
-  document: vscode.TextDocument,
-  position: vscode.Position
 ): Promise<BlameStory | null> {
 
-  // 1. Function cache hit — fastest path when inside a known symbol
+  // 1. Function cache hit
   if (functionName) {
     const fKey = fnKey(repoId, sha, repoRelativePath, functionName);
     if (cache.has(fKey)) { return cache.get(fKey) ?? null; }
@@ -267,7 +237,7 @@ async function getOrFetch(
   const lKey = lineKey(repoId, sha, repoRelativePath, originalLine);
   if (cache.has(lKey)) { return cache.get(lKey) ?? null; }
 
-  // 3. In-flight deduplication for this exact line
+  // 3. In-flight deduplication
   if (inFlight.has(lKey)) { return inFlight.get(lKey)!; }
 
   // 4. API call
@@ -277,7 +247,6 @@ async function getOrFetch(
     inFlight.delete(lKey);
     cache.set(lKey, story);
 
-    // Also cache under function key if the backend resolved one
     if (story?.function_name) {
       const fKey = fnKey(repoId, sha, repoRelativePath, story.function_name);
       cache.set(fKey, story);
@@ -304,7 +273,6 @@ class GitTimeMachineHoverProvider implements vscode.HoverProvider {
     const backendUrl = config.get<string>("backendUrl", "http://localhost:8000");
     const repoId = config.get<number>("repoId", 1);
 
-    // Run git blame and symbol lookup concurrently — both are local, fast
     const [blameInfo, functionName] = await Promise.all([
       getBlameInfo(document.uri.fsPath, position.line + 1),
       getEnclosingSymbol(document, position.line),
@@ -317,7 +285,6 @@ class GitTimeMachineHoverProvider implements vscode.HoverProvider {
     const story = await getOrFetch(
       backendUrl, repoId, sha, repoRelativePath,
       originalLine, functionName,
-      document, position
     );
 
     return story ? new vscode.Hover(buildHoverContent(story)) : null;

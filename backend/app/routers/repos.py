@@ -1,11 +1,14 @@
 from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException
 from sqlalchemy.orm import Session
+
 from ..database import SessionLocal
 from .. import models, schemas
 from ..ingestion import ingest_repo_commits
 from .. import github_client
+from ..models import RepoStatus
 
 router = APIRouter()
+
 
 def get_db():
     db = SessionLocal()
@@ -36,7 +39,7 @@ def add_repo(
         name=payload.name,
         full_name=full_name,
         default_branch=default_branch,
-        status="indexing",
+        status=RepoStatus.indexing,
     )
     db.add(repo)
     db.commit()
@@ -57,7 +60,7 @@ def refresh_repo(
     if not repo:
         raise HTTPException(status_code=404, detail="Repo not found")
 
-    repo.status = "indexing"
+    repo.status = RepoStatus.indexing
     db.commit()
     db.refresh(repo)
 

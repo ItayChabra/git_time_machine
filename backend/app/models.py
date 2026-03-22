@@ -1,6 +1,18 @@
-from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Boolean
+import enum
+
+from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Index, UniqueConstraint
+from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import relationship
+
 from .database import Base
+
+
+# ── Repo status enum ──────────────────────────────────────────────────────────
+class RepoStatus(str, enum.Enum):
+    indexing = "indexing"
+    ready = "ready"
+    error = "error"
+
 
 class Repo(Base):
     __tablename__ = "repos"
@@ -8,7 +20,11 @@ class Repo(Base):
     owner = Column(String, index=True)
     name = Column(String, index=True)
     default_branch = Column(String, default="main")
-    status = Column(String, default="indexing", nullable=False)
+    status = Column(
+        SAEnum(RepoStatus, native_enum=False, create_constraint=False),
+        default=RepoStatus.indexing,
+        nullable=False,
+    )
     full_name = Column(String, unique=True, index=True)  # "owner/name"
 
     commits = relationship("Commit", back_populates="repo")
@@ -45,6 +61,10 @@ class PullRequest(Base):
     state = Column(String)
     merged_at = Column(DateTime)
 
+    __table_args__ = (
+        UniqueConstraint("repo_id", "number", name="uq_pr_repo_number"),
+    )
+
     repo = relationship("Repo", back_populates="prs")
     commits = relationship("Commit", back_populates="pr")
     episode_memberships = relationship("EpisodeMember", back_populates="pr")
@@ -59,6 +79,10 @@ class Issue(Base):
     body = Column(Text)
     state = Column(String)
 
+    __table_args__ = (
+        UniqueConstraint("repo_id", "number", name="uq_issue_repo_number"),
+    )
+
     repo = relationship("Repo", back_populates="issues")
     episode_memberships = relationship("EpisodeMember", back_populates="issue")
 
@@ -68,8 +92,8 @@ class FileChange(Base):
     id = Column(Integer, primary_key=True, index=True)
     commit_id = Column(Integer, ForeignKey("commits.id"))
     file_path = Column(String, index=True)
-    change_type = Column(String)  # added/modified/deleted
-    patch = Column(Text, nullable=True)  # raw unified diff for this file; None for binary/large diffs
+    change_type = Column(String)
+    patch = Column(Text, nullable=True)
 
     commit = relationship("Commit", back_populates="file_changes")
 
@@ -96,7 +120,32 @@ class EpisodeMember(Base):
     issue_id = Column(Integer, ForeignKey("issues.id"), nullable=True)
     member_type = Column(String)  # "commit" / "pr" / "issue"
 
+    __table_args__ = (
+        Index("ix_ep_member_episode_type", "episode_id", "member_type"),
+        Index("ix_ep_member_commit", "commit_id"),
+    )
+
     episode = relationship("Episode", back_populates="members")
     commit = relationship("Commit", back_populates="episode_memberships")
     pr = relationship("PullRequest", back_populates="episode_memberships")
     issue = relationship("Issue", back_populates="episode_memberships")
+
+
+class Explanation(Base):
+    """
+    Persistent cache for LLM hover explanations.
+
+    Keyed on a string that encodes the cache type + identity:
+      - Function-scoped: "fn:<full_sha>:<file_path>:<function_name>"
+      - Hunk-scoped:     "hunk:<full_sha>:<file_path>:<hunk_start>"
+
+    Because a commit SHA is immutable, these explanations never go stale.
+    There is intentionally no TTL or expiry logic — once computed, an
+    explanation is valid forever.
+    """
+    __tablename__ = "explanations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # Unique lookup key — indexed for fast exact-match reads
+    cache_key = Column(String, unique=True, nullable=False, index=True)
+    explanation = Column(Text, nullable=False)

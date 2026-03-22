@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, select
 from sqlalchemy.orm import aliased, Session
 import re
+
 from ..database import SessionLocal
 from .. import models, schemas
 from ..episodes import episodes_for_file, file_story_for_file
@@ -9,20 +10,38 @@ from ..llm import explain_function, explain_hunk
 
 router = APIRouter()
 
-# ── Explanation cache ─────────────────────────────────────────────────────────
-# Two separate caches with different key shapes:
-#
-# Function cache: (repo_id, sha, file_path, function_name)
-#   Used when VS Code symbol provider identified the enclosing function.
-#   One Gemini call per function per commit — all lines inside the same
-#   function share this entry. Semantically correct, no hunk bleed.
-#
-# Hunk cache: (repo_id, sha, file_path, hunk_start)
-#   Fallback for lines outside any symbol (global scope, decorators, etc.)
-#   Same behavior as v0.3.3.
 
-_function_cache: dict[tuple, str] = {}
-_hunk_cache: dict[tuple, str] = {}
+# ── Persistent explanation cache ──────────────────────────────────────────────
+# Explanations are stored in the `explanations` DB table so they survive
+# server restarts. Because commit SHAs are immutable, cached explanations
+# never go stale — there is no TTL or eviction logic needed.
+#
+# Key format:
+#   fn:<sha>:<file_path>:<function_name>   — function-scoped
+#   hunk:<sha>:<file_path>:<hunk_start>    — hunk-scoped fallback
+#
+# An in-process dict acts as an L1 hit to avoid a DB round-trip on
+# repeated hovers within the same server session.
+
+_mem_cache: dict[str, str] = {}
+
+
+def _cache_get(key: str, db: Session) -> str | None:
+    if key in _mem_cache:
+        return _mem_cache[key]
+    row = db.query(models.Explanation).filter_by(cache_key=key).first()
+    if row:
+        _mem_cache[key] = row.explanation
+        return row.explanation
+    return None
+
+
+def _cache_set(key: str, value: str, db: Session) -> None:
+    _mem_cache[key] = value
+    # INSERT ... ON CONFLICT DO NOTHING — safe under concurrent workers
+    if not db.query(models.Explanation).filter_by(cache_key=key).first():
+        db.add(models.Explanation(cache_key=key, explanation=value))
+        db.flush()
 
 
 def get_db():
@@ -100,35 +119,21 @@ def get_file_story(repo_id: int, file_path: str = Query(...), db: Session = Depe
 @router.get("/{repo_id}/blame_story", response_model=schemas.BlameStory)
 def get_blame_story(
     repo_id: int,
-    sha: str = Query(...),
+    sha: str = Query(...),           # full 40-char SHA from git blame
     file_path: str = Query(None),
     original_line: int = Query(None),
-    function_name: str = Query(None),  # from VS Code symbol provider
+    function_name: str = Query(None),
     db: Session = Depends(get_db),
 ):
-    """
-    Core hover endpoint.
-
-    Precision hierarchy:
-      1. Function-scoped (function_name from VS Code symbol provider)
-         Cache key: sha + file + function_name
-         LLM is explicitly anchored on the named symbol — no hunk bleed.
-
-      2. Hunk-scoped fallback (original_line, no function_name)
-         Used when the line is outside any symbol (global scope, decorators).
-         Cache key: sha + file + hunk_start (v0.3.3 behavior)
-
-      3. Episode-level (no patch stored)
-         Last resort, returns PR-level summary.
-    """
     repo = db.query(models.Repo).filter_by(id=repo_id).first()
     if not repo:
         raise HTTPException(status_code=404, detail="Repo not found")
 
+    # Exact SHA match — no startswith needed now that the extension sends the full SHA
     commit = (
         db.query(models.Commit)
         .filter_by(repo_id=repo_id)
-        .filter(models.Commit.sha.startswith(sha))
+        .filter(models.Commit.sha == sha)
         .first()
     )
     if not commit:
@@ -148,24 +153,15 @@ def get_blame_story(
         if file_change and file_change.patch:
             pr = commit.pr
 
-            # Always extract the hunk for original_line first.
-            # For function-scoped path: pass the hunk (not full patch) so the
-            # LLM only sees the diff containing this function, not unrelated
-            # functions committed in the same changeset.
-            # For hunk fallback: same hunk used directly.
             hunk, hunk_start, _ = _extract_hunk_for_line(
                 file_change.patch, original_line or 1
             )
 
             if function_name and original_line:
-                # ── Path 1: Function-scoped (VS Code symbol provider) ──────
-                # Cache by function name — all lines inside share one entry.
-                # Send only the hunk containing original_line, not the full
-                # patch — prevents the LLM from reading adjacent functions.
-                cache_key = (repo_id, sha[:8], file_path, function_name)
-                if cache_key in _function_cache:
-                    file_explanation = _function_cache[cache_key]
-                else:
+                # ── Path 1: Function-scoped ────────────────────────────────
+                cache_key = f"fn:{sha}:{file_path}:{function_name}"
+                file_explanation = _cache_get(cache_key, db)
+                if file_explanation is None:
                     file_explanation = explain_function(
                         file_path=file_path,
                         function_name=function_name,
@@ -174,18 +170,15 @@ def get_blame_story(
                         pr_title=pr.title if pr else None,
                         pr_body=pr.body if pr else None,
                     )
-                    _function_cache[cache_key] = file_explanation
+                    _cache_set(cache_key, file_explanation, db)
                 resolved_function_name = function_name
 
             elif original_line:
                 # ── Path 2: Hunk-scoped fallback ───────────────────────────
-                # Line is outside any symbol (global scope, blank lines, etc.)
-                # or language server wasn't available.
                 if hunk_start is not None:
-                    cache_key = (repo_id, sha[:8], file_path, hunk_start)
-                    if cache_key in _hunk_cache:
-                        file_explanation = _hunk_cache[cache_key]
-                    else:
+                    cache_key = f"hunk:{sha}:{file_path}:{hunk_start}"
+                    file_explanation = _cache_get(cache_key, db)
+                    if file_explanation is None:
                         file_explanation = explain_hunk(
                             file_path=file_path,
                             hunk=hunk,
@@ -193,7 +186,7 @@ def get_blame_story(
                             pr_title=pr.title if pr else None,
                             pr_body=pr.body if pr else None,
                         )
-                        _hunk_cache[cache_key] = file_explanation
+                        _cache_set(cache_key, file_explanation, db)
 
     # ── Episode (PR-level fallback context) ───────────────────────────────
     pr_member = aliased(models.EpisodeMember)
@@ -248,6 +241,8 @@ def get_blame_story(
             pr_number=row.pr_number,
             issue_number=row.issue_number,
         )
+
+    db.commit()
 
     return schemas.BlameStory(
         sha=sha,
