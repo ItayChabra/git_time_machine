@@ -1,10 +1,13 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime
+
 
 class RepoCreate(BaseModel):
     owner: str
     name: str
+    max_commits: int = Field(default=200, ge=1, le=5000)
+
 
 class RepoOut(BaseModel):
     id: int
@@ -20,6 +23,7 @@ class RepoOut(BaseModel):
 
 class FileEntry(BaseModel):
     path: str
+
 
 class EpisodeSummary(BaseModel):
     id: int
@@ -43,10 +47,6 @@ class FileStory(BaseModel):
 class BlameStory(BaseModel):
     sha: str
     file_path: Optional[str] = None
-    # function_name: the VS Code symbol name containing the hovered line.
-    # Returned so the extension can cache at the semantic function level.
-    # None when the hovered line was outside any symbol (global scope)
-    # and hunk-based fallback was used instead.
     function_name: Optional[str] = None
     file_explanation: Optional[str] = None
     episode: Optional[EpisodeSummary] = None

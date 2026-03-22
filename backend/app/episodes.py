@@ -9,6 +9,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.orm import aliased, Session
 
 from . import models, schemas
+from .credentials import Credentials
 from .llm import summarize_episode, summarize_file_evolution
 
 
@@ -30,7 +31,7 @@ def _build_llm_context(
     }
 
 
-def build_and_persist_episodes(repo_id: int, db: Session) -> None:
+def build_and_persist_episodes(repo_id: int, db: Session, creds: Credentials) -> None:
     """
     Groups commits per file into episodes (by PR first, then time-windowed for
     raw commits), calls LLM per episode, and persists Episode + EpisodeMember
@@ -43,7 +44,6 @@ def build_and_persist_episodes(repo_id: int, db: Session) -> None:
         db.delete(ep)
     db.commit()
 
-    # Fetch all commits for this repo ordered by date
     commits = (
         db.query(models.Commit)
         .filter_by(repo_id=repo_id)
@@ -54,7 +54,7 @@ def build_and_persist_episodes(repo_id: int, db: Session) -> None:
     if not commits:
         return
 
-    # ── Pre-load merged PRs once (avoids N+1 in the heuristic loop below) ──
+    # Pre-load merged PRs once to avoid N+1 in heuristic loop
     merged_prs = (
         db.query(models.PullRequest)
         .filter_by(repo_id=repo_id)
@@ -64,20 +64,11 @@ def build_and_persist_episodes(repo_id: int, db: Session) -> None:
     )
     merged_pr_times = [pr.merged_at for pr in merged_prs]
 
-    # ── Pre-load PR id → object map for direct PR lookups ──────────────────
-    pr_by_id: dict[int, models.PullRequest] = {pr.id: pr for pr in merged_prs}
-    # Also include non-merged PRs (linked commits may reference open PRs)
-    all_prs = (
-        db.query(models.PullRequest)
-        .filter_by(repo_id=repo_id)
-        .all()
-    )
-    for pr in all_prs:
-        pr_by_id.setdefault(pr.id, pr)
+    all_prs = db.query(models.PullRequest).filter_by(repo_id=repo_id).all()
+    pr_by_id: dict[int, models.PullRequest] = {pr.id: pr for pr in all_prs}
 
-    # ── Episode grouping ────────────────────────────────────────────────────
+    # Episode grouping
     windows: list[list[models.Commit]] = []
-
     commits_by_pr: dict[int, list[models.Commit]] = {}
     unlinked_commits: list[models.Commit] = []
 
@@ -93,7 +84,6 @@ def build_and_persist_episodes(repo_id: int, db: Session) -> None:
     if unlinked_commits:
         window = [unlinked_commits[0]]
         window_end = unlinked_commits[0].date
-
         for c in unlinked_commits[1:]:
             if c.date - window_end <= timedelta(days=1):
                 window.append(c)
@@ -110,24 +100,19 @@ def build_and_persist_episodes(repo_id: int, db: Session) -> None:
         pr: models.PullRequest | None = None
         issue: models.Issue | None = None
 
-        # (a) Direct pr_id link
         linked_commit = next((c for c in window_commits if c.pr_id is not None), None)
         if linked_commit is not None:
             pr = pr_by_id.get(linked_commit.pr_id)
 
-        # (b) Heuristic: use preloaded list + bisect — O(log N) per window,
-        #     not one DB query per commit (was N+1).
         if pr is None:
-            approx_hours_after_commit = 24
             for c in window_commits:
                 lo = bisect.bisect_left(merged_pr_times, c.date)
                 hi = bisect.bisect_right(
-                    merged_pr_times, c.date + timedelta(hours=approx_hours_after_commit)
+                    merged_pr_times, c.date + timedelta(hours=24)
                 )
                 candidates = merged_prs[lo:hi]
                 if not candidates:
                     continue
-
                 pr_match = candidates[0]
                 c.pr_id = pr_match.id
                 db.flush()
@@ -135,7 +120,6 @@ def build_and_persist_episodes(repo_id: int, db: Session) -> None:
                 pr_by_id[pr_match.id] = pr_match
                 break
 
-        # Find linked issue via #number mentions
         all_text = " ".join([
             *(c.message or "" for c in window_commits),
             pr.title if pr else "",
@@ -157,7 +141,11 @@ def build_and_persist_episodes(repo_id: int, db: Session) -> None:
             title = f"Changes on {window_commits[0].date.date().isoformat()}"
 
         context = _build_llm_context(window_commits, pr, issue)
-        llm_summary = summarize_episode(context)
+        llm_summary = summarize_episode(
+            context,
+            api_key=creds.gemini_api_key,
+            model=creds.gemini_model,
+        )
 
         ep = models.Episode(
             repo_id=repo_id,
@@ -180,9 +168,6 @@ def build_and_persist_episodes(repo_id: int, db: Session) -> None:
 
 
 def episodes_for_file(repo_id: int, file_path: str, db: Session) -> List[schemas.EpisodeSummary]:
-    """
-    Reads persisted episodes that touch the given file, returns them sorted by date.
-    """
     commit_ids_for_file = (
         select(models.Commit.id)
         .join(models.FileChange, models.FileChange.commit_id == models.Commit.id)
@@ -215,21 +200,15 @@ def episodes_for_file(repo_id: int, file_path: str, db: Session) -> List[schemas
             models.PullRequest.number.label("pr_number"),
             models.Issue.number.label("issue_number"),
         )
-        .outerjoin(
-            pr_member,
-            and_(
-                pr_member.episode_id == models.Episode.id,
-                pr_member.member_type == "pr",
-            ),
-        )
+        .outerjoin(pr_member, and_(
+            pr_member.episode_id == models.Episode.id,
+            pr_member.member_type == "pr",
+        ))
         .outerjoin(models.PullRequest, models.PullRequest.id == pr_member.pr_id)
-        .outerjoin(
-            issue_member,
-            and_(
-                issue_member.episode_id == models.Episode.id,
-                issue_member.member_type == "issue",
-            ),
-        )
+        .outerjoin(issue_member, and_(
+            issue_member.episode_id == models.Episode.id,
+            issue_member.member_type == "issue",
+        ))
         .outerjoin(models.Issue, models.Issue.id == issue_member.issue_id)
         .where(models.Episode.id.in_(episode_ids_for_file))
         .order_by(models.Episode.start_date.asc())
@@ -250,19 +229,22 @@ def episodes_for_file(repo_id: int, file_path: str, db: Session) -> List[schemas
     ]
 
 
-def file_story_for_file(repo_id: int, file_path: str, db: Session) -> str | None:
-    """
-    Build 1-2 sentence high-level story for a file based on chronological episode summaries.
-    Returns None when there are no episodes or when the LLM call fails.
-    """
+def file_story_for_file(
+    repo_id: int,
+    file_path: str,
+    db: Session,
+    creds: Credentials,
+) -> str | None:
     ep_summaries = episodes_for_file(repo_id=repo_id, file_path=file_path, db=db)
     chronological = [ep.llm_summary for ep in ep_summaries if ep.llm_summary]
     if not chronological:
         return None
 
-    story = summarize_file_evolution(episodes_summaries=chronological)
-    if not story:
-        return None
-    if story.startswith("File story failed:"):
+    story = summarize_file_evolution(
+        episodes_summaries=chronological,
+        api_key=creds.gemini_api_key,
+        model=creds.gemini_model,
+    )
+    if not story or story.startswith("File story failed:"):
         return None
     return story

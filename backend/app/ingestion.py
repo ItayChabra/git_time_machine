@@ -1,13 +1,13 @@
 import logging
 import math
+import bisect
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-
-import bisect
 
 from sqlalchemy.orm import Session
 
 from . import github_client, models
+from .credentials import Credentials
 from .database import SessionLocal
 from .episodes import build_and_persist_episodes
 from .models import RepoStatus
@@ -18,15 +18,6 @@ logger = logging.getLogger(__name__)
 def _heuristic_link_commits(
     db: Session, repo_id: int, sha_to_commit_obj: dict
 ) -> None:
-    """
-    Pre-linking step: for any commit still missing pr_id, attempt to associate
-    it with a PR by looking for the earliest merged PR within 24 hours after
-    the commit date. Runs in ingestion so episodes.py can trust pr_id.
-
-    Fix: preload all merged PRs once (O(1) query) then use bisect for O(log N)
-    per-commit lookup instead of one DB query per commit (N+1).
-    """
-    # Load all merged PRs for this repo sorted by merged_at — one query total.
     merged_prs = (
         db.query(models.PullRequest)
         .filter_by(repo_id=repo_id)
@@ -54,7 +45,7 @@ def _heuristic_link_commits(
     db.flush()
 
 
-def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
+def ingest_repo_commits(repo_id: int, creds: Credentials, max_commits: int = 200) -> None:
     db = SessionLocal()
     target_repo = None
     try:
@@ -62,10 +53,10 @@ def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
         if not target_repo:
             return
 
-        gh = github_client.GitHubClient()
+        gh = github_client.GitHubClient(token=creds.github_token)
 
         # ── 1. Fetch commit list ───────────────────────────────────────────
-        per_page = min(100, max_commits) if max_commits > 0 else 20
+        per_page = min(100, max_commits) if max_commits > 0 else 100
         max_pages = math.ceil(max_commits / per_page) if max_commits > 0 else 1
 
         raw_commits = gh.list_commits(
@@ -75,9 +66,7 @@ def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
         raw_commits = raw_commits[:max_commits] if max_commits > 0 else raw_commits
 
         sha_to_commit_obj: dict[str, models.Commit] = {}
-
-        # Collect SHAs that need file fetching (skip already-ingested commits)
-        commits_needing_files: list[tuple] = []  # (sha, raw_commit_dict)
+        commits_needing_files: list[tuple] = []
 
         for c in raw_commits:
             commit_date = c.get("commit", {}).get("author", {}).get("date")
@@ -103,10 +92,7 @@ def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
             sha_to_commit_obj[c["sha"]] = commit_obj
             commits_needing_files.append((c["sha"], commit_obj))
 
-        # ── 2. Fetch file changes in parallel ─────────────────────────────
-        # Use a thread pool so we don't make N sequential HTTP calls.
-        # GitHub throttles heavy sequential usage; parallel bursts are
-        # handled better and stay within rate limits for typical batch sizes.
+        # ── 2. Fetch file changes in parallel (capped at 3 workers) ───────
         owner, name = target_repo.owner, target_repo.name
 
         def _fetch_files(sha: str):
@@ -150,7 +136,7 @@ def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
 
         raw_prs = gh.list_pulls(
             target_repo.owner, target_repo.name,
-            state="all", per_page=20, max_pages=1,
+            state="all", per_page=100, max_pages=5,
         )
 
         pr_number_to_obj: dict[int, models.PullRequest] = {}
@@ -173,7 +159,7 @@ def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
             pr_number_to_obj[pr_number] = pr_obj
             existing_pr_numbers.add(pr_number)
 
-        # ── 4. Link commits → PRs via PR commits API ──────────────────────
+        # ── 4. Link commits → PRs ─────────────────────────────────────────
         for pr_number, pr_obj in pr_number_to_obj.items():
             pr_commit_shas = gh.list_pr_commit_shas(
                 target_repo.owner, target_repo.name, pr_number
@@ -183,7 +169,7 @@ def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
                 if commit_obj and commit_obj.pr_id is None:
                     commit_obj.pr_id = pr_obj.id
 
-        # ── 5. Heuristic pre-linking for commits still missing pr_id ──────
+        # ── 5. Heuristic pre-linking ──────────────────────────────────────
         _heuristic_link_commits(
             db=db, repo_id=target_repo.id, sha_to_commit_obj=sha_to_commit_obj
         )
@@ -196,7 +182,7 @@ def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
 
         raw_issues = gh.list_issues(
             target_repo.owner, target_repo.name,
-            state="all", per_page=20, max_pages=1,
+            state="all", per_page=100, max_pages=5,
         )
 
         for issue in raw_issues:
@@ -216,7 +202,7 @@ def ingest_repo_commits(repo_id: int, max_commits: int = 20) -> None:
             db.flush()
             existing_issue_numbers.add(issue_number)
 
-        build_and_persist_episodes(repo_id=target_repo.id, db=db)
+        build_and_persist_episodes(repo_id=target_repo.id, db=db, creds=creds)
         target_repo.status = RepoStatus.ready
         db.commit()
 
