@@ -1,6 +1,22 @@
-from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Boolean
+import enum
+
+from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Index, UniqueConstraint
+from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import relationship
+
 from .database import Base
+
+
+# ── Repo status enum ──────────────────────────────────────────────────────────
+# native_enum=False keeps the column as VARCHAR so no DB migration is needed
+# for existing databases whose values are already valid strings.
+# create_constraint=False skips the CHECK constraint (also avoids migration).
+
+class RepoStatus(str, enum.Enum):
+    indexing = "indexing"
+    ready = "ready"
+    error = "error"
+
 
 class Repo(Base):
     __tablename__ = "repos"
@@ -8,7 +24,11 @@ class Repo(Base):
     owner = Column(String, index=True)
     name = Column(String, index=True)
     default_branch = Column(String, default="main")
-    status = Column(String, default="indexing", nullable=False)
+    status = Column(
+        SAEnum(RepoStatus, native_enum=False, create_constraint=False),
+        default=RepoStatus.indexing,
+        nullable=False,
+    )
     full_name = Column(String, unique=True, index=True)  # "owner/name"
 
     commits = relationship("Commit", back_populates="repo")
@@ -45,6 +65,11 @@ class PullRequest(Base):
     state = Column(String)
     merged_at = Column(DateTime)
 
+    # Unique composite index: a PR number is unique within a repo
+    __table_args__ = (
+        UniqueConstraint("repo_id", "number", name="uq_pr_repo_number"),
+    )
+
     repo = relationship("Repo", back_populates="prs")
     commits = relationship("Commit", back_populates="pr")
     episode_memberships = relationship("EpisodeMember", back_populates="pr")
@@ -58,6 +83,11 @@ class Issue(Base):
     title = Column(String)
     body = Column(Text)
     state = Column(String)
+
+    # Unique composite index: an issue number is unique within a repo
+    __table_args__ = (
+        UniqueConstraint("repo_id", "number", name="uq_issue_repo_number"),
+    )
 
     repo = relationship("Repo", back_populates="issues")
     episode_memberships = relationship("EpisodeMember", back_populates="issue")
@@ -95,6 +125,12 @@ class EpisodeMember(Base):
     pr_id = Column(Integer, ForeignKey("pull_requests.id"), nullable=True)
     issue_id = Column(Integer, ForeignKey("issues.id"), nullable=True)
     member_type = Column(String)  # "commit" / "pr" / "issue"
+
+    # Composite indexes for the join-heavy queries in episodes.py and files.py
+    __table_args__ = (
+        Index("ix_ep_member_episode_type", "episode_id", "member_type"),
+        Index("ix_ep_member_commit", "commit_id"),
+    )
 
     episode = relationship("Episode", back_populates="members")
     commit = relationship("Commit", back_populates="episode_memberships")
