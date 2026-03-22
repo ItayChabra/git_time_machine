@@ -1,4 +1,3 @@
-from collections import OrderedDict
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, select
 from sqlalchemy.orm import aliased, Session
@@ -12,41 +11,37 @@ from ..llm import explain_function, explain_hunk
 router = APIRouter()
 
 
-# ── Bounded LRU cache ─────────────────────────────────────────────────────────
-# Replaces plain module-level dicts which had no eviction and would grow
-# unboundedly over time. 1 000 entries per cache ≈ a few MB at most.
-# For multi-worker deployments, migrate these to Redis (already in docker-compose).
-
-class _LRUCache(OrderedDict):
-    """Simple bounded LRU cache backed by an OrderedDict."""
-
-    def __init__(self, maxsize: int = 1_000):
-        super().__init__()
-        self.maxsize = maxsize
-
-    def __setitem__(self, key, value):
-        if key in self:
-            self.move_to_end(key)
-        super().__setitem__(key, value)
-        if len(self) > self.maxsize:
-            self.popitem(last=False)  # evict least-recently used
-
-    def __getitem__(self, key):
-        value = super().__getitem__(key)
-        self.move_to_end(key)  # mark as recently used
-        return value
-
-
-# Two separate caches with different key shapes:
+# ── Persistent explanation cache ──────────────────────────────────────────────
+# Explanations are stored in the `explanations` DB table so they survive
+# server restarts. Because commit SHAs are immutable, cached explanations
+# never go stale — there is no TTL or eviction logic needed.
 #
-# Function cache: (repo_id, sha, file_path, function_name)
-#   Used when VS Code symbol provider identified the enclosing function.
+# Key format:
+#   fn:<sha>:<file_path>:<function_name>   — function-scoped
+#   hunk:<sha>:<file_path>:<hunk_start>    — hunk-scoped fallback
 #
-# Hunk cache: (repo_id, sha, file_path, hunk_start)
-#   Fallback for lines outside any symbol (global scope, decorators, etc.)
+# An in-process dict acts as an L1 hit to avoid a DB round-trip on
+# repeated hovers within the same server session.
 
-_function_cache: _LRUCache = _LRUCache(maxsize=1_000)
-_hunk_cache: _LRUCache = _LRUCache(maxsize=1_000)
+_mem_cache: dict[str, str] = {}
+
+
+def _cache_get(key: str, db: Session) -> str | None:
+    if key in _mem_cache:
+        return _mem_cache[key]
+    row = db.query(models.Explanation).filter_by(cache_key=key).first()
+    if row:
+        _mem_cache[key] = row.explanation
+        return row.explanation
+    return None
+
+
+def _cache_set(key: str, value: str, db: Session) -> None:
+    _mem_cache[key] = value
+    # INSERT ... ON CONFLICT DO NOTHING — safe under concurrent workers
+    if not db.query(models.Explanation).filter_by(cache_key=key).first():
+        db.add(models.Explanation(cache_key=key, explanation=value))
+        db.flush()
 
 
 def get_db():
@@ -124,28 +119,21 @@ def get_file_story(repo_id: int, file_path: str = Query(...), db: Session = Depe
 @router.get("/{repo_id}/blame_story", response_model=schemas.BlameStory)
 def get_blame_story(
     repo_id: int,
-    sha: str = Query(...),
+    sha: str = Query(...),           # full 40-char SHA from git blame
     file_path: str = Query(None),
     original_line: int = Query(None),
-    function_name: str = Query(None),  # from VS Code symbol provider
+    function_name: str = Query(None),
     db: Session = Depends(get_db),
 ):
-    """
-    Core hover endpoint.
-
-    Precision hierarchy:
-      1. Function-scoped (function_name from VS Code symbol provider)
-      2. Hunk-scoped fallback (original_line, no function_name)
-      3. Episode-level (no patch stored) — last resort
-    """
     repo = db.query(models.Repo).filter_by(id=repo_id).first()
     if not repo:
         raise HTTPException(status_code=404, detail="Repo not found")
 
+    # Exact SHA match — no startswith needed now that the extension sends the full SHA
     commit = (
         db.query(models.Commit)
         .filter_by(repo_id=repo_id)
-        .filter(models.Commit.sha.startswith(sha))
+        .filter(models.Commit.sha == sha)
         .first()
     )
     if not commit:
@@ -171,10 +159,9 @@ def get_blame_story(
 
             if function_name and original_line:
                 # ── Path 1: Function-scoped ────────────────────────────────
-                cache_key = (repo_id, sha[:8], file_path, function_name)
-                if cache_key in _function_cache:
-                    file_explanation = _function_cache[cache_key]
-                else:
+                cache_key = f"fn:{sha}:{file_path}:{function_name}"
+                file_explanation = _cache_get(cache_key, db)
+                if file_explanation is None:
                     file_explanation = explain_function(
                         file_path=file_path,
                         function_name=function_name,
@@ -183,16 +170,15 @@ def get_blame_story(
                         pr_title=pr.title if pr else None,
                         pr_body=pr.body if pr else None,
                     )
-                    _function_cache[cache_key] = file_explanation
+                    _cache_set(cache_key, file_explanation, db)
                 resolved_function_name = function_name
 
             elif original_line:
                 # ── Path 2: Hunk-scoped fallback ───────────────────────────
                 if hunk_start is not None:
-                    cache_key = (repo_id, sha[:8], file_path, hunk_start)
-                    if cache_key in _hunk_cache:
-                        file_explanation = _hunk_cache[cache_key]
-                    else:
+                    cache_key = f"hunk:{sha}:{file_path}:{hunk_start}"
+                    file_explanation = _cache_get(cache_key, db)
+                    if file_explanation is None:
                         file_explanation = explain_hunk(
                             file_path=file_path,
                             hunk=hunk,
@@ -200,7 +186,7 @@ def get_blame_story(
                             pr_title=pr.title if pr else None,
                             pr_body=pr.body if pr else None,
                         )
-                        _hunk_cache[cache_key] = file_explanation
+                        _cache_set(cache_key, file_explanation, db)
 
     # ── Episode (PR-level fallback context) ───────────────────────────────
     pr_member = aliased(models.EpisodeMember)
@@ -255,6 +241,8 @@ def get_blame_story(
             pr_number=row.pr_number,
             issue_number=row.issue_number,
         )
+
+    db.commit()
 
     return schemas.BlameStory(
         sha=sha,

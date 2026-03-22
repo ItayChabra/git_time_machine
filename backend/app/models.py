@@ -8,10 +8,6 @@ from .database import Base
 
 
 # ── Repo status enum ──────────────────────────────────────────────────────────
-# native_enum=False keeps the column as VARCHAR so no DB migration is needed
-# for existing databases whose values are already valid strings.
-# create_constraint=False skips the CHECK constraint (also avoids migration).
-
 class RepoStatus(str, enum.Enum):
     indexing = "indexing"
     ready = "ready"
@@ -65,7 +61,6 @@ class PullRequest(Base):
     state = Column(String)
     merged_at = Column(DateTime)
 
-    # Unique composite index: a PR number is unique within a repo
     __table_args__ = (
         UniqueConstraint("repo_id", "number", name="uq_pr_repo_number"),
     )
@@ -84,7 +79,6 @@ class Issue(Base):
     body = Column(Text)
     state = Column(String)
 
-    # Unique composite index: an issue number is unique within a repo
     __table_args__ = (
         UniqueConstraint("repo_id", "number", name="uq_issue_repo_number"),
     )
@@ -98,8 +92,8 @@ class FileChange(Base):
     id = Column(Integer, primary_key=True, index=True)
     commit_id = Column(Integer, ForeignKey("commits.id"))
     file_path = Column(String, index=True)
-    change_type = Column(String)  # added/modified/deleted
-    patch = Column(Text, nullable=True)  # raw unified diff for this file; None for binary/large diffs
+    change_type = Column(String)
+    patch = Column(Text, nullable=True)
 
     commit = relationship("Commit", back_populates="file_changes")
 
@@ -126,7 +120,6 @@ class EpisodeMember(Base):
     issue_id = Column(Integer, ForeignKey("issues.id"), nullable=True)
     member_type = Column(String)  # "commit" / "pr" / "issue"
 
-    # Composite indexes for the join-heavy queries in episodes.py and files.py
     __table_args__ = (
         Index("ix_ep_member_episode_type", "episode_id", "member_type"),
         Index("ix_ep_member_commit", "commit_id"),
@@ -136,3 +129,23 @@ class EpisodeMember(Base):
     commit = relationship("Commit", back_populates="episode_memberships")
     pr = relationship("PullRequest", back_populates="episode_memberships")
     issue = relationship("Issue", back_populates="episode_memberships")
+
+
+class Explanation(Base):
+    """
+    Persistent cache for LLM hover explanations.
+
+    Keyed on a string that encodes the cache type + identity:
+      - Function-scoped: "fn:<full_sha>:<file_path>:<function_name>"
+      - Hunk-scoped:     "hunk:<full_sha>:<file_path>:<hunk_start>"
+
+    Because a commit SHA is immutable, these explanations never go stale.
+    There is intentionally no TTL or expiry logic — once computed, an
+    explanation is valid forever.
+    """
+    __tablename__ = "explanations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # Unique lookup key — indexed for fast exact-match reads
+    cache_key = Column(String, unique=True, nullable=False, index=True)
+    explanation = Column(Text, nullable=False)
