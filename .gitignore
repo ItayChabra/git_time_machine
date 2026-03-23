@@ -12,3 +12,7 @@ __pycache__/
 # IDEs
 .vscode/
 .cursorrules
+
+node_modules/
+out/
+*.vsix

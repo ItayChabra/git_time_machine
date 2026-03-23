@@ -1,0 +1,96 @@
+{
+  "name": "git-time-machine",
+  "displayName": "Git Time Machine",
+  "description": "Hover over any line to see why it was written \u2014 powered by your Git history and AI.",
+  "version": "0.6.0",
+  "publisher": "ItayChabra",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ItayChabra/git_time_machine"
+  },
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "gitTimeMachine.ingestRepo",
+        "title": "Git Time Machine: Index Current Repo"
+      },
+      {
+        "command": "gitTimeMachine.clearCache",
+        "title": "Git Time Machine: Clear Explanation Cache"
+      },
+      {
+        "command": "gitTimeMachine.resetData",
+        "title": "Git Time Machine: Reset All Data"
+      }
+    ],
+    "configuration": {
+      "title": "Git Time Machine",
+      "properties": {
+        "gitTimeMachine.githubToken": {
+          "type": "string",
+          "default": "",
+          "description": "Your GitHub personal access token (needs repo read scope)."
+        },
+        "gitTimeMachine.geminiApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Your Google Gemini API key."
+        },
+        "gitTimeMachine.geminiModel": {
+          "type": "string",
+          "default": "gemini-2.0-flash",
+          "enum": [
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-3-flash-preview"
+          ],
+          "enumDescriptions": [
+            "Best quality explanations (recommended).",
+            "Faster and cheaper \u2014 slightly less precise.",
+            "Latest preview model \u2014 may change without notice."
+          ],
+          "description": "Gemini model used for hover explanations."
+        },
+        "gitTimeMachine.maxPRs": {
+          "type": "number",
+          "default": 50,
+          "minimum": 1,
+          "maximum": 500,
+          "description": "How many recent merged PRs to index. Each PR becomes one episode."
+        },
+        "gitTimeMachine.maxUnlinkedCommits": {
+          "type": "number",
+          "default": 50,
+          "minimum": 0,
+          "maximum": 500,
+          "description": "How many recent commits not tied to a PR to also index."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "sql.js": "^1.12.0"
+  },
+  "devDependencies": {
+    "@types/sql.js": "^1.4.9",
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.0.0"
+  }
+}
