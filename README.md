@@ -86,6 +86,14 @@ Git Time Machine indexes your repository's pull request and commit history, then
 
 ---
 
+## Credits
+
+Icon composed from:
+- [Git icons](https://www.flaticon.com/free-icons/git) created by pocike — Flaticon
+- [Time machine icons](https://www.flaticon.com/free-icons/time-machine) created by Freepik — Flaticon
+
+---
+
 ## Privacy
 
 - Your source code and git diff hunks are sent to the **Google Gemini API** for explanation generation
