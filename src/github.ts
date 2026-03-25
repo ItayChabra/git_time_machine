@@ -14,7 +14,10 @@ export function makeLimiter(concurrency: number) {
         running++;
         fn()
           .then(resolve, reject)
-          .finally(() => { running--; queue.shift()?.(); });
+          .finally(() => {
+            running--;
+            queue.shift()?.();
+          });
       };
       running < concurrency ? run() : queue.push(run);
     });
@@ -22,35 +25,44 @@ export function makeLimiter(concurrency: number) {
 }
 
 export function sleep(ms: number): Promise<void> {
-  return new Promise(r => setTimeout(r, ms));
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 // ── Core HTTP ─────────────────────────────────────────────────────────────────
 
 async function ghGet(url: string, token: string): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, {
-      headers: {
-        "Accept": "application/vnd.github+json",
-        "Authorization": `Bearer ${token}`,
-        "User-Agent": "git-time-machine-vscode",
-        "X-GitHub-Api-Version": "2022-11-28",
+    const req = https.get(
+      url,
+      {
+        headers: {
+          Accept: "application/vnd.github+json",
+          Authorization: `Bearer ${token}`,
+          "User-Agent": "git-time-machine-vscode",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
       },
-    }, (res) => {
-      let data = "";
-      res.on("data", c => (data += c));
-      res.on("end", () => {
-        if (res.statusCode === 200) {
-          try { resolve(JSON.parse(data)); }
-          catch { reject(new Error("JSON parse failed")); }
-        } else {
-          reject(Object.assign(
-            new Error(`HTTP ${res.statusCode}: ${data.slice(0, 200)}`),
-            { statusCode: res.statusCode }
-          ));
-        }
-      });
-    });
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => {
+          if (res.statusCode === 200) {
+            try {
+              resolve(JSON.parse(data));
+            } catch {
+              reject(new Error("JSON parse failed"));
+            }
+          } else {
+            reject(
+              Object.assign(
+                new Error(`HTTP ${res.statusCode}: ${data.slice(0, 200)}`),
+                { statusCode: res.statusCode }
+              )
+            );
+          }
+        });
+      }
+    );
     req.on("error", reject);
   });
 }
@@ -113,22 +125,32 @@ export interface GHIssue {
 
 // ── API calls ─────────────────────────────────────────────────────────────────
 
-export async function getRepo(owner: string, name: string, token: string): Promise<GHRepo> {
-  return ghGetWithRetry(`${GITHUB_API}/repos/${owner}/${name}`, token) as Promise<GHRepo>;
+export async function getRepo(
+  owner: string,
+  name: string,
+  token: string
+): Promise<GHRepo> {
+  return ghGetWithRetry(
+    `${GITHUB_API}/repos/${owner}/${name}`,
+    token
+  ) as Promise<GHRepo>;
 }
 
 export async function listMergedPRs(
-  owner: string, name: string, token: string, maxPRs: number
+  owner: string,
+  name: string,
+  token: string,
+  maxPRs: number
 ): Promise<GHPullRequest[]> {
   const result: GHPullRequest[] = [];
   let page = 1;
   while (result.length < maxPRs) {
-    const batch = await ghGetWithRetry(
+    const batch = (await ghGetWithRetry(
       `${GITHUB_API}/repos/${owner}/${name}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=${page}`,
       token
-    ) as GHPullRequest[];
+    )) as GHPullRequest[];
     if (!batch.length) { break; }
-    result.push(...batch.filter(pr => pr.merged_at !== null));
+    result.push(...batch.filter((pr) => pr.merged_at !== null));
     if (batch.length < 100) { break; }
     page++;
   }
@@ -136,17 +158,20 @@ export async function listMergedPRs(
 }
 
 export async function listPRCommitShas(
-  owner: string, name: string, prNumber: number, token: string
+  owner: string,
+  name: string,
+  prNumber: number,
+  token: string
 ): Promise<string[]> {
   const shas: string[] = [];
   let page = 1;
   while (true) {
-    const batch = await ghGetWithRetry(
+    const batch = (await ghGetWithRetry(
       `${GITHUB_API}/repos/${owner}/${name}/pulls/${prNumber}/commits?per_page=100&page=${page}`,
       token
-    ) as GHCommit[];
+    )) as GHCommit[];
     if (!batch.length) { break; }
-    shas.push(...batch.map(c => c.sha));
+    shas.push(...batch.map((c) => c.sha));
     if (batch.length < 100) { break; }
     page++;
   }
@@ -154,7 +179,10 @@ export async function listPRCommitShas(
 }
 
 export async function getCommitDetail(
-  owner: string, name: string, sha: string, token: string
+  owner: string,
+  name: string,
+  sha: string,
+  token: string
 ): Promise<GHCommitDetail> {
   return ghGetWithRetry(
     `${GITHUB_API}/repos/${owner}/${name}/commits/${sha}`,
@@ -163,16 +191,20 @@ export async function getCommitDetail(
 }
 
 export async function listRecentCommits(
-  owner: string, name: string, token: string, max: number, since?: string
+  owner: string,
+  name: string,
+  token: string,
+  max: number,
+  since?: string
 ): Promise<GHCommit[]> {
   const result: GHCommit[] = [];
   let page = 1;
   const sinceParam = since ? `&since=${encodeURIComponent(since)}` : "";
   while (result.length < max) {
-    const batch = await ghGetWithRetry(
+    const batch = (await ghGetWithRetry(
       `${GITHUB_API}/repos/${owner}/${name}/commits?per_page=100&page=${page}${sinceParam}`,
       token
-    ) as GHCommit[];
+    )) as GHCommit[];
     if (!batch.length) { break; }
     result.push(...batch);
     if (batch.length < 100) { break; }
@@ -182,19 +214,23 @@ export async function listRecentCommits(
 }
 
 export async function listIssues(
-  owner: string, name: string, token: string
+  owner: string,
+  name: string,
+  token: string,
+  max: number
 ): Promise<GHIssue[]> {
+  if (max === 0) { return []; }
   const result: GHIssue[] = [];
   let page = 1;
-  while (true) {
-    const batch = await ghGetWithRetry(
+  while (result.length < max) {
+    const batch = (await ghGetWithRetry(
       `${GITHUB_API}/repos/${owner}/${name}/issues?state=all&per_page=100&page=${page}`,
       token
-    ) as GHIssue[];
+    )) as GHIssue[];
     if (!batch.length) { break; }
-    result.push(...batch.filter(i => !i.pull_request));
+    result.push(...batch.filter((i) => !i.pull_request));
     if (batch.length < 100) { break; }
     page++;
   }
-  return result;
+  return result.slice(0, max);
 }

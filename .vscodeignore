@@ -5,4 +5,4 @@ src/**
 tsconfig.json
 **/*.map
 node_modules/**
-!node_modules/sql.js/dist/sql-wasm.wasm
+!node_modules/sql.js/**
