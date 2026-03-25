@@ -1,0 +1,136 @@
+{
+  "name": "git-time-machine",
+  "displayName": "Git Time Machine",
+  "description": "Hover over any line to see why it was written — powered by your Git history and AI.",
+  "version": "0.6.1",
+  "publisher": "ItayChabra",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ItayChabra/git_time_machine"
+  },
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0" 
+  },
+  "icon": "icon.png",
+  "categories": [
+    "AI",
+    "SCM Providers",
+    "Other"
+  ],
+  "keywords": [
+    "git",
+    "blame",
+    "AI",
+    "code history",
+    "why",
+    "hover",
+    "gemini",
+    "pull request",
+    "explanation",
+    "git log"
+  ],
+  "galleryBanner": {
+    "color": "#1e1e2e",
+    "theme": "dark"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Git blame and repo indexing require a trusted workspace."
+    }
+  },
+  "activationEvents": [
+    "workspaceContains:.git"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "gitTimeMachine.setGithubToken",
+        "title": "Git Time Machine: Set GitHub Token"
+      },
+      {
+        "command": "gitTimeMachine.setGeminiApiKey",
+        "title": "Git Time Machine: Set Gemini API Key"
+      },
+      {
+        "command": "gitTimeMachine.ingestRepo",
+        "title": "Git Time Machine: Index Current Repo"
+      },
+      {
+        "command": "gitTimeMachine.clearCache",
+        "title": "Git Time Machine: Clear Explanation Cache"
+      },
+      {
+        "command": "gitTimeMachine.resetData",
+        "title": "Git Time Machine: Reset All Data"
+      }
+    ],
+    "configuration": {
+      "title": "Git Time Machine",
+      "properties": {
+        "gitTimeMachine.githubToken": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "**Deprecated** — use the `Git Time Machine: Set GitHub Token` command instead. Any value here will be auto-migrated to secure storage on first use and then cleared."
+        },
+        "gitTimeMachine.geminiApiKey": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "**Deprecated** — use the `Git Time Machine: Set Gemini API Key` command instead. Any value here will be auto-migrated to secure storage on first use and then cleared."
+        },
+        "gitTimeMachine.geminiModel": {
+          "type": "string",
+          "default": "gemini-2.5-flash",
+          "enum": [
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-3.1-flash-preview"
+          ],
+          "enumDescriptions": [
+            "Best quality explanations (recommended default).",
+            "Faster and cheaper — slightly less precise.",
+            "Latest preview model — may change without notice."
+          ],
+          "description": "Gemini model used for hover explanations."
+        },
+        "gitTimeMachine.maxPRs": {
+          "type": "number",
+          "default": 50,
+          "minimum": 1,
+          "maximum": 500,
+          "description": "How many recent merged PRs to index. Each PR becomes one episode."
+        },
+        "gitTimeMachine.maxUnlinkedCommits": {
+          "type": "number",
+          "default": 50,
+          "minimum": 0,
+          "maximum": 500,
+          "description": "How many recent commits not tied to a PR to also index."
+        },
+        "gitTimeMachine.maxIssues": {
+          "type": "number",
+          "default": 200,
+          "minimum": 0,
+          "maximum": 2000,
+          "description": "How many issues to index. Set to 0 to skip issue indexing entirely."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "sql.js": "^1.12.0"
+  },
+  "devDependencies": {
+    "@types/sql.js": "^1.4.9",
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.0.0"
+  }
+}
