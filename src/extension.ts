@@ -113,6 +113,14 @@ function purgeOldCacheEntries(db: Database): void {
   }
 }
 
+// ── Text helpers ─────────────────────────────────────────────────────────────
+
+function normalizeExplanation(text: string): string {
+  return text
+    .replace(/\n(\*\*(?:Does|Why|Don't change):\*\*)/g, '\n\n$1')
+    .trim();
+}
+
 // ── Git helpers ───────────────────────────────────────────────────────────────
 
 function parseGitHubRemote(url: string): { owner: string; name: string } | null {
@@ -543,7 +551,7 @@ async function getBlameStory(
 
   const cached = cacheGet(cacheKey, db);
   if (cached) {
-    return { sha, file_path: filePath, function_name: functionName, file_explanation: cached, episode };
+    return { sha, file_path: filePath, function_name: functionName, file_explanation: normalizeExplanation(cached), episode };
   }
 
   try {
@@ -592,11 +600,12 @@ async function getBlameStory(
     }
 
     // Don't cache transient errors — let the next hover retry cleanly
-    if (!explanation.startsWith("Error:") && !explanation.startsWith("Explanation failed")) {
-      cacheSet(cacheKey, explanation, db);
+    const normalized = normalizeExplanation(explanation);
+    if (!normalized.startsWith("Error:") && !normalized.startsWith("Explanation failed")) {
+      cacheSet(cacheKey, normalized, db);
     }
 
-    return { sha, file_path: filePath, function_name: functionName, file_explanation: explanation, episode };
+    return { sha, file_path: filePath, function_name: functionName, file_explanation: normalized, episode };
   } catch (e) {
     console.error("[GTM] getBlameStory failed:", e);
     return { sha, file_path: filePath, function_name: null, file_explanation: null, episode };
